@@ -1,0 +1,27 @@
+{
+  "name": "apollo-standalone",
+  "version": "1.0.0",
+  "description": "Makes a standalone javascript package of apollo client.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "compile": "rm -rf ./dist && mkdir ./dist && browserify ./index.js -o=./dist/apollo.js && npm run minify:browser",
+    "minify:browser": "uglifyjs --compress --mangle --screw-ie8 --output=./dist/apollo.min.js -- ./dist/apollo.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/oitmain/apollo-npm-standalone.git"
+  },
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/oitmain/apollo-npm-standalone/issues"
+  },
+  "homepage": "https://github.com/oitmain/apollo-npm-standalone#readme",
+  "dependencies": {
+    "apollo-client": "^1.9.3",
+    "browserify": "^14.4.0",
+    "graphql-tag": "^2.5.0",
+    "uglify-js": "^3.1.4"
+  }
+}
