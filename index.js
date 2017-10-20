@@ -1,2 +1,2 @@
-var apollo = require("apollo-client");
-var gql = require("graphql-tag");
+global.apollo = require("apollo-client");
+global.gql = require("graphql-tag");
