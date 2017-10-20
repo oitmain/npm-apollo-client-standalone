@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "compile": "rm -rf ./dist && mkdir ./dist && browserify ./index.js -o=./dist/apollo.js && npm run minify:browser",
+    "compile": "export NODE_ENV=production && rm -rf ./dist && mkdir ./dist && browserify ./index.js -o=./dist/apollo.js -t loose-envify && npm run minify:browser",
     "minify:browser": "uglifyjs --compress --mangle --screw-ie8 --output=./dist/apollo.min.js -- ./dist/apollo.js"
   },
   "repository": {
@@ -22,6 +22,7 @@
     "apollo-client": "^1.9.3",
     "browserify": "^14.4.0",
     "graphql-tag": "^2.5.0",
+    "loose-envify": "^1.3.1",
     "uglify-js": "^3.1.4"
   }
 }

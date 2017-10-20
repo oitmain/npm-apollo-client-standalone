@@ -7953,7 +7953,6 @@ function bindActionCreators(actionCreators, dispatch) {
   return boundActionCreators;
 }
 },{}],39:[function(require,module,exports){
-(function (process){
 'use strict';
 
 exports.__esModule = true;
@@ -8041,7 +8040,7 @@ function combineReducers(reducers) {
   for (var i = 0; i < reducerKeys.length; i++) {
     var key = reducerKeys[i];
 
-    if (process.env.NODE_ENV !== 'production') {
+    if ("production" !== 'production') {
       if (typeof reducers[key] === 'undefined') {
         (0, _warning2['default'])('No reducer provided for key "' + key + '"');
       }
@@ -8054,7 +8053,7 @@ function combineReducers(reducers) {
   var finalReducerKeys = Object.keys(finalReducers);
 
   var unexpectedKeyCache = void 0;
-  if (process.env.NODE_ENV !== 'production') {
+  if ("production" !== 'production') {
     unexpectedKeyCache = {};
   }
 
@@ -8073,7 +8072,7 @@ function combineReducers(reducers) {
       throw shapeAssertionError;
     }
 
-    if (process.env.NODE_ENV !== 'production') {
+    if ("production" !== 'production') {
       var warningMessage = getUnexpectedStateShapeWarningMessage(state, finalReducers, action, unexpectedKeyCache);
       if (warningMessage) {
         (0, _warning2['default'])(warningMessage);
@@ -8097,8 +8096,7 @@ function combineReducers(reducers) {
     return hasChanged ? nextState : state;
   };
 }
-}).call(this,require('_process'))
-},{"./createStore":41,"./utils/warning":43,"_process":36,"lodash/isPlainObject":35}],40:[function(require,module,exports){
+},{"./createStore":41,"./utils/warning":43,"lodash/isPlainObject":35}],40:[function(require,module,exports){
 "use strict";
 
 exports.__esModule = true;
@@ -8398,7 +8396,6 @@ var ActionTypes = exports.ActionTypes = {
   }, _ref2[_symbolObservable2['default']] = observable, _ref2;
 }
 },{"lodash/isPlainObject":35,"symbol-observable":44}],42:[function(require,module,exports){
-(function (process){
 'use strict';
 
 exports.__esModule = true;
@@ -8436,7 +8433,7 @@ function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'd
 */
 function isCrushed() {}
 
-if (process.env.NODE_ENV !== 'production' && typeof isCrushed.name === 'string' && isCrushed.name !== 'isCrushed') {
+if ("production" !== 'production' && typeof isCrushed.name === 'string' && isCrushed.name !== 'isCrushed') {
   (0, _warning2['default'])('You are currently using minified code outside of NODE_ENV === \'production\'. ' + 'This means that you are running a slower development build of Redux. ' + 'You can use loose-envify (https://github.com/zertosh/loose-envify) for browserify ' + 'or DefinePlugin for webpack (http://stackoverflow.com/questions/30030031) ' + 'to ensure you have the correct code for your production build.');
 }
 
@@ -8445,8 +8442,7 @@ exports.combineReducers = _combineReducers2['default'];
 exports.bindActionCreators = _bindActionCreators2['default'];
 exports.applyMiddleware = _applyMiddleware2['default'];
 exports.compose = _compose2['default'];
-}).call(this,require('_process'))
-},{"./applyMiddleware":37,"./bindActionCreators":38,"./combineReducers":39,"./compose":40,"./createStore":41,"./utils/warning":43,"_process":36}],43:[function(require,module,exports){
+},{"./applyMiddleware":37,"./bindActionCreators":38,"./combineReducers":39,"./compose":40,"./createStore":41,"./utils/warning":43}],43:[function(require,module,exports){
 'use strict';
 
 exports.__esModule = true;
