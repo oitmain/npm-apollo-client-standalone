@@ -1,20 +1,3172 @@
 (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
 (function (global){
-global.apollo = require("apollo-client");
-global.gql = require("graphql-tag");
+global.ApolloStandalone = {
+    "apollo-client": require("apollo-client"),
+    "graphql-tag": require("graphql-tag"),
+    "apollo-link-http": require("apollo-link-http"),
+    "apollo-cache-inmemory": require("apollo-cache-inmemory")
+};
 
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"apollo-client":2,"graphql-tag":12}],2:[function(require,module,exports){
-(function (process){
+},{"apollo-cache-inmemory":2,"apollo-client":4,"apollo-link-http":6,"graphql-tag":10}],2:[function(require,module,exports){
 (function (global, factory) {
-	typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('whatwg-fetch'), require('graphql/language/printer'), require('redux'), require('graphql-anywhere'), require('symbol-observable'), require('apollo-link-core')) :
-	typeof define === 'function' && define.amd ? define(['exports', 'whatwg-fetch', 'graphql/language/printer', 'redux', 'graphql-anywhere', 'symbol-observable', 'apollo-link-core'], factory) :
-	(factory((global.apollo = {}),null,global.printer,global.Redux,global.graphqlAnywhere,global.$$observable,global.apolloLinkCore));
-}(this, (function (exports,whatwgFetch,printer,redux,graphqlAnywhere,$$observable,apolloLinkCore) { 'use strict';
+	typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('apollo-cache'), require('apollo-utilities'), require('graphql/language/printer'), require('graphql-anywhere')) :
+	typeof define === 'function' && define.amd ? define(['exports', 'apollo-cache', 'apollo-utilities', 'graphql/language/printer', 'graphql-anywhere'], factory) :
+	(factory((global.apollo = global.apollo || {}, global.apollo.cache = global.apollo.cache || {}, global.apollo.cache.inmemory = {}),global.apolloCache.core,global.apollo.utilities,global.printer,global.graphqlAnywhere));
+}(this, (function (exports,apolloCache,apolloUtilities,printer,graphqlAnywhere) { 'use strict';
 
 graphqlAnywhere = graphqlAnywhere && graphqlAnywhere.hasOwnProperty('default') ? graphqlAnywhere['default'] : graphqlAnywhere;
+
+var haveWarned = false;
+var HeuristicFragmentMatcher = (function () {
+    function HeuristicFragmentMatcher() {
+    }
+    HeuristicFragmentMatcher.prototype.ensureReady = function () {
+        return Promise.resolve();
+    };
+    HeuristicFragmentMatcher.prototype.canBypassInit = function () {
+        return true;
+    };
+    HeuristicFragmentMatcher.prototype.match = function (idValue, typeCondition, context) {
+        var obj = context.store.get(idValue.id);
+        if (!obj) {
+            return false;
+        }
+        if (!obj.__typename) {
+            if (!haveWarned) {
+                console.warn("You're using fragments in your queries, but either don't have the addTypename:\n  true option set in Apollo Client, or you are trying to write a fragment to the store without the __typename.\n   Please turn on the addTypename option and include __typename when writing fragments so that Apollo Client\n   can accurately match fragments.");
+                console.warn('Could not find __typename on Fragment ', typeCondition, obj);
+                console.warn("DEPRECATION WARNING: using fragments without __typename is unsupported behavior " +
+                    "and will be removed in future versions of Apollo client. You should fix this and set addTypename to true now.");
+                if (!apolloUtilities.isTest()) {
+                    haveWarned = true;
+                }
+            }
+            context.returnPartialData = true;
+            return true;
+        }
+        if (obj.__typename === typeCondition) {
+            return true;
+        }
+        apolloUtilities.warnOnceInDevelopment("You are using the simple (heuristic) fragment matcher, but your queries contain union or interface types.\n     Apollo Client will not be able to able to accurately map fragments." +
+            "To make this error go away, use the IntrospectionFragmentMatcher as described in the docs: " +
+            "http://dev.apollodata.com/react/initialization.html#fragment-matcher", 'error');
+        context.returnPartialData = true;
+        return true;
+    };
+    return HeuristicFragmentMatcher;
+}());
+var IntrospectionFragmentMatcher = (function () {
+    function IntrospectionFragmentMatcher(options) {
+        if (options && options.introspectionQueryResultData) {
+            this.possibleTypesMap = this.parseIntrospectionResult(options.introspectionQueryResultData);
+            this.isReady = true;
+        }
+        else {
+            this.isReady = false;
+        }
+        this.match = this.match.bind(this);
+    }
+    IntrospectionFragmentMatcher.prototype.match = function (idValue, typeCondition, context) {
+        if (!this.isReady) {
+            throw new Error('FragmentMatcher.match() was called before FragmentMatcher.init()');
+        }
+        var obj = context.store.get(idValue.id);
+        if (!obj) {
+            return false;
+        }
+        if (!obj.__typename) {
+            throw new Error("Cannot match fragment because __typename property is missing: " + JSON.stringify(obj));
+        }
+        if (obj.__typename === typeCondition) {
+            return true;
+        }
+        var implementingTypes = this.possibleTypesMap[typeCondition];
+        if (implementingTypes && implementingTypes.indexOf(obj.__typename) > -1) {
+            return true;
+        }
+        return false;
+    };
+    IntrospectionFragmentMatcher.prototype.parseIntrospectionResult = function (introspectionResultData) {
+        var typeMap = {};
+        introspectionResultData.__schema.types.forEach(function (type) {
+            if (type.kind === 'UNION' || type.kind === 'INTERFACE') {
+                typeMap[type.name] = type.possibleTypes.map(function (implementingType) { return implementingType.name; });
+            }
+        });
+        return typeMap;
+    };
+    return IntrospectionFragmentMatcher;
+}());
+
+var ObjectCache = (function () {
+    function ObjectCache(data) {
+        if (data === void 0) { data = {}; }
+        this.data = data;
+    }
+    ObjectCache.prototype.toObject = function () {
+        return this.data;
+    };
+    ObjectCache.prototype.get = function (dataId) {
+        return this.data[dataId];
+    };
+    ObjectCache.prototype.set = function (dataId, value) {
+        this.data[dataId] = value;
+    };
+    ObjectCache.prototype.delete = function (dataId) {
+        this.data[dataId] = undefined;
+    };
+    ObjectCache.prototype.clear = function () {
+        this.data = {};
+    };
+    ObjectCache.prototype.replace = function (newData) {
+        this.data = newData || {};
+    };
+    return ObjectCache;
+}());
+function defaultNormalizedCacheFactory(seed) {
+    return new ObjectCache(seed);
+}
+
+var __extends$1 = (undefined && undefined.__extends) || (function () {
+    var extendStatics = Object.setPrototypeOf ||
+        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
+        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
+    return function (d, b) {
+        extendStatics(d, b);
+        function __() { this.constructor = d; }
+        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+    };
+})();
+var __assign$1 = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var WriteError = (function (_super) {
+    __extends$1(WriteError, _super);
+    function WriteError() {
+        var _this = _super !== null && _super.apply(this, arguments) || this;
+        _this.type = 'WriteError';
+        return _this;
+    }
+    return WriteError;
+}(Error));
+function enhanceErrorWithDocument(error, document) {
+    var enhancedError = new WriteError("Error writing result to store for query:\n " + printer.print(document));
+    enhancedError.message += '\n' + error.message;
+    enhancedError.stack = error.stack;
+    return enhancedError;
+}
+function writeQueryToStore(_a) {
+    var result = _a.result, query = _a.query, _b = _a.storeFactory, storeFactory = _b === void 0 ? defaultNormalizedCacheFactory : _b, _c = _a.store, store = _c === void 0 ? storeFactory() : _c, variables = _a.variables, dataIdFromObject = _a.dataIdFromObject, _d = _a.fragmentMap, fragmentMap = _d === void 0 ? {} : _d, fragmentMatcherFunction = _a.fragmentMatcherFunction;
+    var queryDefinition = apolloUtilities.getQueryDefinition(query);
+    variables = apolloUtilities.assign({}, apolloUtilities.getDefaultValues(queryDefinition), variables);
+    try {
+        return writeSelectionSetToStore({
+            dataId: 'ROOT_QUERY',
+            result: result,
+            selectionSet: queryDefinition.selectionSet,
+            context: {
+                store: store,
+                storeFactory: storeFactory,
+                processedData: {},
+                variables: variables,
+                dataIdFromObject: dataIdFromObject,
+                fragmentMap: fragmentMap,
+                fragmentMatcherFunction: fragmentMatcherFunction,
+            },
+        });
+    }
+    catch (e) {
+        throw enhanceErrorWithDocument(e, query);
+    }
+}
+function writeResultToStore(_a) {
+    var dataId = _a.dataId, result = _a.result, document = _a.document, _b = _a.storeFactory, storeFactory = _b === void 0 ? defaultNormalizedCacheFactory : _b, _c = _a.store, store = _c === void 0 ? storeFactory() : _c, variables = _a.variables, dataIdFromObject = _a.dataIdFromObject, fragmentMatcherFunction = _a.fragmentMatcherFunction;
+    var operationDefinition = apolloUtilities.getOperationDefinition(document);
+    var selectionSet = operationDefinition.selectionSet;
+    var fragmentMap = apolloUtilities.createFragmentMap(apolloUtilities.getFragmentDefinitions(document));
+    variables = apolloUtilities.assign({}, apolloUtilities.getDefaultValues(operationDefinition), variables);
+    try {
+        return writeSelectionSetToStore({
+            result: result,
+            dataId: dataId,
+            selectionSet: selectionSet,
+            context: {
+                store: store,
+                storeFactory: storeFactory,
+                processedData: {},
+                variables: variables,
+                dataIdFromObject: dataIdFromObject,
+                fragmentMap: fragmentMap,
+                fragmentMatcherFunction: fragmentMatcherFunction,
+            },
+        });
+    }
+    catch (e) {
+        throw enhanceErrorWithDocument(e, document);
+    }
+}
+function writeSelectionSetToStore(_a) {
+    var result = _a.result, dataId = _a.dataId, selectionSet = _a.selectionSet, context = _a.context;
+    var variables = context.variables, store = context.store, fragmentMap = context.fragmentMap;
+    selectionSet.selections.forEach(function (selection) {
+        var included = apolloUtilities.shouldInclude(selection, variables);
+        if (apolloUtilities.isField(selection)) {
+            var resultFieldKey = apolloUtilities.resultKeyNameFromField(selection);
+            var value = result[resultFieldKey];
+            if (included) {
+                if (typeof value !== 'undefined') {
+                    writeFieldToStore({
+                        dataId: dataId,
+                        value: value,
+                        field: selection,
+                        context: context,
+                    });
+                }
+                else {
+                    var isDefered = selection.directives &&
+                        selection.directives.length &&
+                        selection.directives.some(function (directive) { return directive.name && directive.name.value === 'defer'; });
+                    if (!isDefered && context.fragmentMatcherFunction) {
+                        if (!apolloUtilities.isProduction()) {
+                            console.warn("Missing field " + resultFieldKey + " in " + JSON.stringify(result, null, 2).substring(0, 100));
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            var fragment = void 0;
+            if (apolloUtilities.isInlineFragment(selection)) {
+                fragment = selection;
+            }
+            else {
+                fragment = (fragmentMap || {})[selection.name.value];
+                if (!fragment) {
+                    throw new Error("No fragment named " + selection.name.value + ".");
+                }
+            }
+            var matches = true;
+            if (context.fragmentMatcherFunction && fragment.typeCondition) {
+                var idValue = { type: 'id', id: 'self', generated: false };
+                var fakeContext = {
+                    store: new ObjectCache({ self: result }),
+                    returnPartialData: false,
+                    hasMissingField: false,
+                    cacheResolvers: {},
+                };
+                matches = context.fragmentMatcherFunction(idValue, fragment.typeCondition.name.value, fakeContext);
+                if (!apolloUtilities.isProduction() && fakeContext.returnPartialData) {
+                    console.error('WARNING: heuristic fragment matching going on!');
+                }
+            }
+            if (included && matches) {
+                writeSelectionSetToStore({
+                    result: result,
+                    selectionSet: fragment.selectionSet,
+                    dataId: dataId,
+                    context: context,
+                });
+            }
+        }
+    });
+    return store;
+}
+function isGeneratedId(id) {
+    return id[0] === '$';
+}
+function mergeWithGenerated(generatedKey, realKey, cache) {
+    var generated = cache.get(generatedKey);
+    var real = cache.get(realKey);
+    Object.keys(generated).forEach(function (key) {
+        var value = generated[key];
+        var realValue = real[key];
+        if (apolloUtilities.isIdValue(value) && isGeneratedId(value.id) && apolloUtilities.isIdValue(realValue)) {
+            mergeWithGenerated(value.id, realValue.id, cache);
+        }
+        cache.delete(generatedKey);
+        cache.set(realKey, __assign$1({}, generated, real));
+    });
+}
+function isDataProcessed(dataId, field, processedData) {
+    if (!processedData) {
+        return false;
+    }
+    if (processedData[dataId]) {
+        if (processedData[dataId].indexOf(field) >= 0) {
+            return true;
+        }
+        else {
+            processedData[dataId].push(field);
+        }
+    }
+    else {
+        processedData[dataId] = [field];
+    }
+    return false;
+}
+function writeFieldToStore(_a) {
+    var field = _a.field, value = _a.value, dataId = _a.dataId, context = _a.context;
+    var variables = context.variables, dataIdFromObject = context.dataIdFromObject, store = context.store;
+    var storeValue;
+    var storeObject;
+    var storeFieldName = apolloUtilities.storeKeyNameFromField(field, variables);
+    var shouldMerge = false;
+    var generatedKey = '';
+    if (!field.selectionSet || value === null) {
+        storeValue =
+            value != null && typeof value === 'object'
+                ?
+                    { type: 'json', json: value }
+                :
+                    value;
+    }
+    else if (Array.isArray(value)) {
+        var generatedId = dataId + "." + storeFieldName;
+        storeValue = processArrayValue(value, generatedId, field.selectionSet, context);
+    }
+    else {
+        var valueDataId = dataId + "." + storeFieldName;
+        var generated = true;
+        if (!isGeneratedId(valueDataId)) {
+            valueDataId = '$' + valueDataId;
+        }
+        if (dataIdFromObject) {
+            var semanticId = dataIdFromObject(value);
+            if (semanticId && isGeneratedId(semanticId)) {
+                throw new Error('IDs returned by dataIdFromObject cannot begin with the "$" character.');
+            }
+            if (semanticId) {
+                valueDataId = semanticId;
+                generated = false;
+            }
+        }
+        if (!isDataProcessed(valueDataId, field, context.processedData)) {
+            writeSelectionSetToStore({
+                dataId: valueDataId,
+                result: value,
+                selectionSet: field.selectionSet,
+                context: context,
+            });
+        }
+        storeValue = {
+            type: 'id',
+            id: valueDataId,
+            generated: generated,
+        };
+        storeObject = store.get(dataId);
+        if (storeObject && storeObject[storeFieldName] !== storeValue) {
+            var escapedId = storeObject[storeFieldName];
+            if (apolloUtilities.isIdValue(storeValue) &&
+                storeValue.generated &&
+                apolloUtilities.isIdValue(escapedId) &&
+                !escapedId.generated) {
+                throw new Error("Store error: the application attempted to write an object with no provided id" +
+                    (" but the store already contains an id of " + escapedId.id + " for this object. The selectionSet") +
+                    " that was trying to be written is:\n" +
+                    printer.print(field));
+            }
+            if (apolloUtilities.isIdValue(escapedId) && escapedId.generated) {
+                generatedKey = escapedId.id;
+                shouldMerge = true;
+            }
+        }
+    }
+    var newStoreObj = __assign$1({}, store.get(dataId), (_b = {}, _b[storeFieldName] = storeValue, _b));
+    if (shouldMerge) {
+        mergeWithGenerated(generatedKey, storeValue.id, store);
+    }
+    storeObject = store.get(dataId);
+    if (!storeObject || storeValue !== storeObject[storeFieldName]) {
+        store.set(dataId, newStoreObj);
+    }
+    var _b;
+}
+function processArrayValue(value, generatedId, selectionSet, context) {
+    return value.map(function (item, index) {
+        if (item === null) {
+            return null;
+        }
+        var itemDataId = generatedId + "." + index;
+        if (Array.isArray(item)) {
+            return processArrayValue(item, itemDataId, selectionSet, context);
+        }
+        var generated = true;
+        if (context.dataIdFromObject) {
+            var semanticId = context.dataIdFromObject(item);
+            if (semanticId) {
+                itemDataId = semanticId;
+                generated = false;
+            }
+        }
+        if (!isDataProcessed(itemDataId, selectionSet, context.processedData)) {
+            writeSelectionSetToStore({
+                dataId: itemDataId,
+                result: item,
+                selectionSet: selectionSet,
+                context: context,
+            });
+        }
+        var idStoreValue = {
+            type: 'id',
+            id: itemDataId,
+            generated: generated,
+        };
+        return idStoreValue;
+    });
+}
+
+var __assign$2 = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var ID_KEY = typeof Symbol !== 'undefined' ? Symbol('id') : '@@id';
+function readQueryFromStore(options) {
+    var optsPatch = { returnPartialData: false };
+    return diffQueryAgainstStore(__assign$2({}, options, optsPatch)).result;
+}
+var readStoreResolver = function (fieldName, idValue, args, context, _a) {
+    var resultKey = _a.resultKey, directives = _a.directives;
+    assertIdValue(idValue);
+    var objId = idValue.id;
+    var obj = context.store.get(objId);
+    var storeKeyName = apolloUtilities.getStoreKeyName(fieldName, args, directives);
+    var fieldValue = (obj || {})[storeKeyName];
+    if (typeof fieldValue === 'undefined') {
+        if (context.cacheResolvers &&
+            obj &&
+            (obj.__typename || objId === 'ROOT_QUERY')) {
+            var typename = obj.__typename || 'Query';
+            var type = context.cacheResolvers[typename];
+            if (type) {
+                var resolver = type[fieldName];
+                if (resolver) {
+                    fieldValue = resolver(obj, args);
+                }
+            }
+        }
+    }
+    if (typeof fieldValue === 'undefined') {
+        if (!context.returnPartialData) {
+            throw new Error("Can't find field " + storeKeyName + " on object (" + objId + ") " + JSON.stringify(obj, null, 2) + ".");
+        }
+        context.hasMissingField = true;
+        return fieldValue;
+    }
+    if (apolloUtilities.isJsonValue(fieldValue)) {
+        if (idValue.previousResult &&
+            apolloUtilities.isEqual(idValue.previousResult[resultKey], fieldValue.json)) {
+            return idValue.previousResult[resultKey];
+        }
+        return fieldValue.json;
+    }
+    if (idValue.previousResult) {
+        fieldValue = addPreviousResultToIdValues(fieldValue, idValue.previousResult[resultKey]);
+    }
+    return fieldValue;
+};
+function diffQueryAgainstStore(_a) {
+    var store = _a.store, query = _a.query, variables = _a.variables, previousResult = _a.previousResult, _b = _a.returnPartialData, returnPartialData = _b === void 0 ? true : _b, _c = _a.rootId, rootId = _c === void 0 ? 'ROOT_QUERY' : _c, fragmentMatcherFunction = _a.fragmentMatcherFunction, config = _a.config;
+    var queryDefinition = apolloUtilities.getQueryDefinition(query);
+    variables = apolloUtilities.assign({}, apolloUtilities.getDefaultValues(queryDefinition), variables);
+    var context = {
+        store: store,
+        returnPartialData: returnPartialData,
+        cacheResolvers: (config && config.cacheResolvers) || {},
+        hasMissingField: false,
+    };
+    var rootIdValue = {
+        type: 'id',
+        id: rootId,
+        previousResult: previousResult,
+    };
+    var result = graphqlAnywhere(readStoreResolver, query, rootIdValue, context, variables, {
+        fragmentMatcher: fragmentMatcherFunction,
+        resultMapper: resultMapper,
+    });
+    return {
+        result: result,
+        complete: !context.hasMissingField,
+    };
+}
+function assertIdValue(idValue) {
+    if (!apolloUtilities.isIdValue(idValue)) {
+        throw new Error("Encountered a sub-selection on the query, but the store doesn't have an object reference. This should never happen during normal use unless you have custom code that is directly manipulating the store; please file an issue.");
+    }
+}
+function addPreviousResultToIdValues(value, previousResult) {
+    if (apolloUtilities.isIdValue(value)) {
+        return __assign$2({}, value, { previousResult: previousResult });
+    }
+    else if (Array.isArray(value)) {
+        var idToPreviousResult_1 = new Map();
+        if (Array.isArray(previousResult)) {
+            previousResult.forEach(function (item) {
+                if (item && item[ID_KEY]) {
+                    idToPreviousResult_1.set(item[ID_KEY], item);
+                }
+            });
+        }
+        return value.map(function (item, i) {
+            var itemPreviousResult = previousResult && previousResult[i];
+            if (apolloUtilities.isIdValue(item)) {
+                itemPreviousResult =
+                    idToPreviousResult_1.get(item.id) || itemPreviousResult;
+            }
+            return addPreviousResultToIdValues(item, itemPreviousResult);
+        });
+    }
+    return value;
+}
+function resultMapper(resultFields, idValue) {
+    if (idValue.previousResult) {
+        var currentResultKeys_1 = Object.keys(resultFields);
+        var sameAsPreviousResult = Object.keys(idValue.previousResult).reduce(function (sameKeys, key) { return sameKeys && currentResultKeys_1.indexOf(key) > -1; }, true) &&
+            currentResultKeys_1.every(function (key) {
+                return areNestedArrayItemsStrictlyEqual(resultFields[key], idValue.previousResult[key]);
+            });
+        if (sameAsPreviousResult) {
+            return idValue.previousResult;
+        }
+    }
+    Object.defineProperty(resultFields, ID_KEY, {
+        enumerable: false,
+        configurable: false,
+        writable: false,
+        value: idValue.id,
+    });
+    return resultFields;
+}
+function areNestedArrayItemsStrictlyEqual(a, b) {
+    if (a === b) {
+        return true;
+    }
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+        return false;
+    }
+    return a.every(function (item, i) { return areNestedArrayItemsStrictlyEqual(item, b[i]); });
+}
+
+var __assign$3 = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var RecordingCache = (function () {
+    function RecordingCache(data) {
+        if (data === void 0) { data = {}; }
+        this.data = data;
+        this.recordedData = {};
+    }
+    RecordingCache.prototype.record = function (transaction) {
+        transaction(this);
+        var recordedData = this.recordedData;
+        this.recordedData = {};
+        return recordedData;
+    };
+    RecordingCache.prototype.toObject = function () {
+        return __assign$3({}, this.data, this.recordedData);
+    };
+    RecordingCache.prototype.get = function (dataId) {
+        if (this.recordedData.hasOwnProperty(dataId)) {
+            return this.recordedData[dataId];
+        }
+        return this.data[dataId];
+    };
+    RecordingCache.prototype.set = function (dataId, value) {
+        if (this.get(dataId) !== value) {
+            this.recordedData[dataId] = value;
+        }
+    };
+    RecordingCache.prototype.delete = function (dataId) {
+        this.recordedData[dataId] = undefined;
+    };
+    RecordingCache.prototype.clear = function () {
+        var _this = this;
+        Object.keys(this.data).forEach(function (dataId) { return _this.delete(dataId); });
+        this.recordedData = {};
+    };
+    RecordingCache.prototype.replace = function (newData) {
+        this.clear();
+        this.recordedData = __assign$3({}, newData);
+    };
+    return RecordingCache;
+}());
+function record(startingState, transaction) {
+    var recordingCache = new RecordingCache(startingState);
+    return recordingCache.record(transaction);
+}
+
+var __extends = (undefined && undefined.__extends) || (function () {
+    var extendStatics = Object.setPrototypeOf ||
+        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
+        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
+    return function (d, b) {
+        extendStatics(d, b);
+        function __() { this.constructor = d; }
+        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+    };
+})();
+var __assign = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var defaultConfig = {
+    fragmentMatcher: new HeuristicFragmentMatcher(),
+    dataIdFromObject: defaultDataIdFromObject,
+    addTypename: true,
+    storeFactory: defaultNormalizedCacheFactory,
+};
+function defaultDataIdFromObject(result) {
+    if (result.__typename) {
+        if (result.id !== undefined) {
+            return result.__typename + ":" + result.id;
+        }
+        if (result._id !== undefined) {
+            return result.__typename + ":" + result._id;
+        }
+    }
+    return null;
+}
+var InMemoryCache = (function (_super) {
+    __extends(InMemoryCache, _super);
+    function InMemoryCache(config) {
+        if (config === void 0) { config = {}; }
+        var _this = _super.call(this) || this;
+        _this.optimistic = [];
+        _this.watches = [];
+        _this.silenceBroadcast = false;
+        _this.config = __assign({}, defaultConfig, config);
+        if (_this.config.customResolvers)
+            _this.config.cacheResolvers = _this.config.customResolvers;
+        _this.addTypename = _this.config.addTypename ? true : false;
+        _this.data = _this.config.storeFactory();
+        return _this;
+    }
+    InMemoryCache.prototype.restore = function (data) {
+        if (data)
+            this.data.replace(data);
+        return this;
+    };
+    InMemoryCache.prototype.extract = function (optimistic) {
+        if (optimistic === void 0) { optimistic = false; }
+        if (optimistic && this.optimistic.length > 0) {
+            var patches = this.optimistic.map(function (opt) { return opt.data; });
+            return Object.assign.apply(Object, [{}, this.data.toObject()].concat(patches));
+        }
+        return this.data.toObject();
+    };
+    InMemoryCache.prototype.read = function (query) {
+        if (query.rootId && this.data.get(query.rootId) === undefined) {
+            return null;
+        }
+        return readQueryFromStore({
+            store: this.config.storeFactory(this.extract(query.optimistic)),
+            query: this.transformDocument(query.query),
+            variables: query.variables,
+            rootId: query.rootId,
+            fragmentMatcherFunction: this.config.fragmentMatcher.match,
+            previousResult: query.previousResult,
+            config: this.config,
+        });
+    };
+    InMemoryCache.prototype.write = function (write) {
+        writeResultToStore({
+            dataId: write.dataId,
+            result: write.result,
+            variables: write.variables,
+            document: this.transformDocument(write.query),
+            store: this.data,
+            dataIdFromObject: this.config.dataIdFromObject,
+            fragmentMatcherFunction: this.config.fragmentMatcher.match,
+        });
+        this.broadcastWatches();
+    };
+    InMemoryCache.prototype.diff = function (query) {
+        return diffQueryAgainstStore({
+            store: this.config.storeFactory(this.extract(query.optimistic)),
+            query: this.transformDocument(query.query),
+            variables: query.variables,
+            returnPartialData: query.returnPartialData,
+            previousResult: query.previousResult,
+            fragmentMatcherFunction: this.config.fragmentMatcher.match,
+            config: this.config,
+        });
+    };
+    InMemoryCache.prototype.watch = function (watch) {
+        var _this = this;
+        this.watches.push(watch);
+        return function () {
+            _this.watches = _this.watches.filter(function (c) { return c !== watch; });
+        };
+    };
+    InMemoryCache.prototype.evict = function (query) {
+        throw new Error("eviction is not implemented on InMemory Cache");
+    };
+    InMemoryCache.prototype.reset = function () {
+        this.data.clear();
+        this.broadcastWatches();
+        return Promise.resolve();
+    };
+    InMemoryCache.prototype.removeOptimistic = function (id) {
+        var _this = this;
+        var toPerform = this.optimistic.filter(function (item) { return item.id !== id; });
+        this.optimistic = [];
+        toPerform.forEach(function (change) {
+            _this.recordOptimisticTransaction(change.transaction, change.id);
+        });
+        this.broadcastWatches();
+    };
+    InMemoryCache.prototype.performTransaction = function (transaction) {
+        var alreadySilenced = this.silenceBroadcast;
+        this.silenceBroadcast = true;
+        transaction(this);
+        if (!alreadySilenced) {
+            this.silenceBroadcast = false;
+        }
+        this.broadcastWatches();
+    };
+    InMemoryCache.prototype.recordOptimisticTransaction = function (transaction, id) {
+        var _this = this;
+        this.silenceBroadcast = true;
+        var patch = record(this.extract(true), function (recordingCache) {
+            var dataCache = _this.data;
+            _this.data = recordingCache;
+            _this.performTransaction(transaction);
+            _this.data = dataCache;
+        });
+        this.optimistic.push({
+            id: id,
+            transaction: transaction,
+            data: patch,
+        });
+        this.silenceBroadcast = false;
+        this.broadcastWatches();
+    };
+    InMemoryCache.prototype.transformDocument = function (document) {
+        if (this.addTypename)
+            return apolloUtilities.addTypenameToDocument(document);
+        return document;
+    };
+    InMemoryCache.prototype.readQuery = function (options, optimistic) {
+        if (optimistic === void 0) { optimistic = false; }
+        return this.read({
+            query: options.query,
+            variables: options.variables,
+            optimistic: optimistic,
+        });
+    };
+    InMemoryCache.prototype.readFragment = function (options, optimistic) {
+        if (optimistic === void 0) { optimistic = false; }
+        return this.read({
+            query: this.transformDocument(apolloUtilities.getFragmentQueryDocument(options.fragment, options.fragmentName)),
+            variables: options.variables,
+            rootId: options.id,
+            optimistic: optimistic,
+        });
+    };
+    InMemoryCache.prototype.writeQuery = function (options) {
+        this.write({
+            dataId: 'ROOT_QUERY',
+            result: options.data,
+            query: this.transformDocument(options.query),
+            variables: options.variables,
+        });
+    };
+    InMemoryCache.prototype.writeFragment = function (options) {
+        this.write({
+            dataId: options.id,
+            result: options.data,
+            query: this.transformDocument(apolloUtilities.getFragmentQueryDocument(options.fragment, options.fragmentName)),
+            variables: options.variables,
+        });
+    };
+    InMemoryCache.prototype.broadcastWatches = function () {
+        var _this = this;
+        if (this.silenceBroadcast)
+            return;
+        this.watches.forEach(function (c) {
+            var newData = _this.diff({
+                query: c.query,
+                variables: c.variables,
+                previousResult: c.previousResult && c.previousResult(),
+                optimistic: c.optimistic,
+            });
+            c.callback(newData);
+        });
+    };
+    return InMemoryCache;
+}(apolloCache.ApolloCache));
+
+exports.InMemoryCache = InMemoryCache;
+exports.defaultDataIdFromObject = defaultDataIdFromObject;
+exports.ID_KEY = ID_KEY;
+exports.readQueryFromStore = readQueryFromStore;
+exports.diffQueryAgainstStore = diffQueryAgainstStore;
+exports.assertIdValue = assertIdValue;
+exports.WriteError = WriteError;
+exports.enhanceErrorWithDocument = enhanceErrorWithDocument;
+exports.writeQueryToStore = writeQueryToStore;
+exports.writeResultToStore = writeResultToStore;
+exports.writeSelectionSetToStore = writeSelectionSetToStore;
+exports.HeuristicFragmentMatcher = HeuristicFragmentMatcher;
+exports.IntrospectionFragmentMatcher = IntrospectionFragmentMatcher;
+exports.ObjectCache = ObjectCache;
+exports.defaultNormalizedCacheFactory = defaultNormalizedCacheFactory;
+exports.RecordingCache = RecordingCache;
+exports.record = record;
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+})));
+
+
+},{"apollo-cache":3,"apollo-utilities":8,"graphql-anywhere":9,"graphql/language/printer":21}],3:[function(require,module,exports){
+(function (global, factory) {
+	typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('apollo-utilities')) :
+	typeof define === 'function' && define.amd ? define(['exports', 'apollo-utilities'], factory) :
+	(factory((global.apollo = global.apollo || {}, global.apollo.cache = global.apollo.cache || {}, global.apollo.cache.core = {}),global.apollo.utilities));
+}(this, (function (exports,apolloUtilities) { 'use strict';
+
+var ApolloCache = (function () {
+    function ApolloCache() {
+    }
+    ApolloCache.prototype.transformDocument = function (document) {
+        return document;
+    };
+    ApolloCache.prototype.transformForLink = function (document) {
+        return document;
+    };
+    ApolloCache.prototype.readQuery = function (options, optimistic) {
+        if (optimistic === void 0) { optimistic = false; }
+        return this.read({
+            query: options.query,
+            variables: options.variables,
+            optimistic: optimistic,
+        });
+    };
+    ApolloCache.prototype.readFragment = function (options, optimistic) {
+        if (optimistic === void 0) { optimistic = false; }
+        return this.read({
+            query: apolloUtilities.getFragmentQueryDocument(options.fragment, options.fragmentName),
+            variables: options.variables,
+            rootId: options.id,
+            optimistic: optimistic,
+        });
+    };
+    ApolloCache.prototype.writeQuery = function (options) {
+        this.write({
+            dataId: 'ROOT_QUERY',
+            result: options.data,
+            query: options.query,
+            variables: options.variables,
+        });
+    };
+    ApolloCache.prototype.writeFragment = function (options) {
+        this.write({
+            dataId: options.id,
+            result: options.data,
+            variables: options.variables,
+            query: apolloUtilities.getFragmentQueryDocument(options.fragment, options.fragmentName),
+        });
+    };
+    return ApolloCache;
+}());
+
+(function (Cache) {
+})(exports.Cache || (exports.Cache = {}));
+
+exports.ApolloCache = ApolloCache;
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+})));
+
+
+},{"apollo-utilities":8}],4:[function(require,module,exports){
+(function (global, factory) {
+	typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('graphql/language/printer'), require('apollo-utilities'), require('apollo-link'), require('symbol-observable'), require('apollo-link-dedup')) :
+	typeof define === 'function' && define.amd ? define(['exports', 'graphql/language/printer', 'apollo-utilities', 'apollo-link', 'symbol-observable', 'apollo-link-dedup'], factory) :
+	(factory((global.apollo = global.apollo || {}, global.apollo.core = {}),global.printer,global.apollo.utilities,global.apolloLink.core,global.$$observable,global.apolloLink.dedup));
+}(this, (function (exports,printer,apolloUtilities,apolloLink,$$observable,apolloLinkDedup) { 'use strict';
+
 $$observable = $$observable && $$observable.hasOwnProperty('default') ? $$observable['default'] : $$observable;
 
+(function (NetworkStatus) {
+    NetworkStatus[NetworkStatus["loading"] = 1] = "loading";
+    NetworkStatus[NetworkStatus["setVariables"] = 2] = "setVariables";
+    NetworkStatus[NetworkStatus["fetchMore"] = 3] = "fetchMore";
+    NetworkStatus[NetworkStatus["refetch"] = 4] = "refetch";
+    NetworkStatus[NetworkStatus["poll"] = 6] = "poll";
+    NetworkStatus[NetworkStatus["ready"] = 7] = "ready";
+    NetworkStatus[NetworkStatus["error"] = 8] = "error";
+})(exports.NetworkStatus || (exports.NetworkStatus = {}));
+function isNetworkRequestInFlight(networkStatus) {
+    return networkStatus < 7;
+}
+
+var __extends$1 = (undefined && undefined.__extends) || (function () {
+    var extendStatics = Object.setPrototypeOf ||
+        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
+        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
+    return function (d, b) {
+        extendStatics(d, b);
+        function __() { this.constructor = d; }
+        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+    };
+})();
+var Observable$1 = (function (_super) {
+    __extends$1(Observable$$1, _super);
+    function Observable$$1() {
+        return _super !== null && _super.apply(this, arguments) || this;
+    }
+    Observable$$1.prototype[$$observable] = function () {
+        return this;
+    };
+    return Observable$$1;
+}(apolloLink.Observable));
+
+var __extends$2 = (undefined && undefined.__extends) || (function () {
+    var extendStatics = Object.setPrototypeOf ||
+        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
+        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
+    return function (d, b) {
+        extendStatics(d, b);
+        function __() { this.constructor = d; }
+        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+    };
+})();
+function isApolloError(err) {
+    return err.hasOwnProperty('graphQLErrors');
+}
+var generateErrorMessage = function (err) {
+    var message = '';
+    if (Array.isArray(err.graphQLErrors) && err.graphQLErrors.length !== 0) {
+        err.graphQLErrors.forEach(function (graphQLError) {
+            var errorMessage = graphQLError
+                ? graphQLError.message
+                : 'Error message not found.';
+            message += "GraphQL error: " + errorMessage + "\n";
+        });
+    }
+    if (err.networkError) {
+        message += 'Network error: ' + err.networkError.message + '\n';
+    }
+    message = message.replace(/\n$/, '');
+    return message;
+};
+var ApolloError = (function (_super) {
+    __extends$2(ApolloError, _super);
+    function ApolloError(_a) {
+        var graphQLErrors = _a.graphQLErrors, networkError = _a.networkError, errorMessage = _a.errorMessage, extraInfo = _a.extraInfo;
+        var _this = _super.call(this, errorMessage) || this;
+        _this.graphQLErrors = graphQLErrors || [];
+        _this.networkError = networkError || null;
+        if (!errorMessage) {
+            _this.message = generateErrorMessage(_this);
+        }
+        else {
+            _this.message = errorMessage;
+        }
+        _this.extraInfo = extraInfo;
+        return _this;
+    }
+    return ApolloError;
+}(Error));
+
+(function (FetchType) {
+    FetchType[FetchType["normal"] = 1] = "normal";
+    FetchType[FetchType["refetch"] = 2] = "refetch";
+    FetchType[FetchType["poll"] = 3] = "poll";
+})(exports.FetchType || (exports.FetchType = {}));
+
+var __extends = (undefined && undefined.__extends) || (function () {
+    var extendStatics = Object.setPrototypeOf ||
+        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
+        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
+    return function (d, b) {
+        extendStatics(d, b);
+        function __() { this.constructor = d; }
+        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+    };
+})();
+var __assign = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var hasError = function (storeValue, policy) {
+    if (policy === void 0) { policy = 'none'; }
+    return storeValue &&
+        ((storeValue.graphQLErrors &&
+            storeValue.graphQLErrors.length > 0 &&
+            policy === 'none') ||
+            storeValue.networkError);
+};
+var ObservableQuery = (function (_super) {
+    __extends(ObservableQuery, _super);
+    function ObservableQuery(_a) {
+        var scheduler = _a.scheduler, options = _a.options, _b = _a.shouldSubscribe, shouldSubscribe = _b === void 0 ? true : _b;
+        var _this = _super.call(this, function (observer) {
+            return _this.onSubscribe(observer);
+        }) || this;
+        _this.isCurrentlyPolling = false;
+        _this.isTornDown = false;
+        _this.options = options;
+        _this.variables = options.variables || {};
+        _this.queryId = scheduler.queryManager.generateQueryId();
+        _this.shouldSubscribe = shouldSubscribe;
+        _this.scheduler = scheduler;
+        _this.queryManager = scheduler.queryManager;
+        _this.observers = [];
+        _this.subscriptionHandles = [];
+        return _this;
+    }
+    ObservableQuery.prototype.result = function () {
+        var that = this;
+        return new Promise(function (resolve, reject) {
+            var subscription;
+            var observer = {
+                next: function (result) {
+                    resolve(result);
+                    if (!that.observers.some(function (obs) { return obs !== observer; })) {
+                        that.queryManager.removeQuery(that.queryId);
+                    }
+                    setTimeout(function () {
+                        subscription.unsubscribe();
+                    }, 0);
+                },
+                error: function (error) {
+                    reject(error);
+                },
+            };
+            subscription = that.subscribe(observer);
+        });
+    };
+    ObservableQuery.prototype.currentResult = function () {
+        if (this.isTornDown) {
+            return {
+                data: this.lastError ? {} : this.lastResult ? this.lastResult.data : {},
+                error: this.lastError,
+                loading: false,
+                networkStatus: exports.NetworkStatus.error,
+            };
+        }
+        var queryStoreValue = this.queryManager.queryStore.get(this.queryId);
+        if (hasError(queryStoreValue, this.options.errorPolicy)) {
+            return {
+                data: {},
+                loading: false,
+                networkStatus: queryStoreValue.networkStatus,
+                error: new ApolloError({
+                    graphQLErrors: queryStoreValue.graphQLErrors,
+                    networkError: queryStoreValue.networkError,
+                }),
+            };
+        }
+        var _a = this.queryManager.getCurrentQueryResult(this), data = _a.data, partial = _a.partial;
+        var queryLoading = !queryStoreValue ||
+            queryStoreValue.networkStatus === exports.NetworkStatus.loading;
+        var loading = (this.options.fetchPolicy === 'network-only' && queryLoading) ||
+            (partial && this.options.fetchPolicy !== 'cache-only');
+        var networkStatus;
+        if (queryStoreValue) {
+            networkStatus = queryStoreValue.networkStatus;
+        }
+        else {
+            networkStatus = loading ? exports.NetworkStatus.loading : exports.NetworkStatus.ready;
+        }
+        var result = {
+            data: data,
+            loading: isNetworkRequestInFlight(networkStatus),
+            networkStatus: networkStatus,
+        };
+        if (queryStoreValue &&
+            queryStoreValue.graphQLErrors &&
+            this.options.errorPolicy === 'all') {
+            result.errors = queryStoreValue.graphQLErrors;
+        }
+        if (!partial) {
+            var stale = false;
+            this.lastResult = __assign({}, result, { stale: stale });
+        }
+        return __assign({}, result, { partial: partial });
+    };
+    ObservableQuery.prototype.getLastResult = function () {
+        return this.lastResult;
+    };
+    ObservableQuery.prototype.getLastError = function () {
+        return this.lastError;
+    };
+    ObservableQuery.prototype.resetLastResults = function () {
+        delete this.lastResult;
+        delete this.lastError;
+        this.isTornDown = false;
+    };
+    ObservableQuery.prototype.refetch = function (variables) {
+        if (this.options.fetchPolicy === 'cache-only') {
+            return Promise.reject(new Error('cache-only fetchPolicy option should not be used together with query refetch.'));
+        }
+        if (!apolloUtilities.isEqual(this.variables, variables)) {
+            this.variables = __assign({}, this.variables, variables);
+        }
+        if (!apolloUtilities.isEqual(this.options.variables, this.variables)) {
+            this.options.variables = __assign({}, this.options.variables, this.variables);
+        }
+        var combinedOptions = __assign({}, this.options, { fetchPolicy: 'network-only' });
+        return this.queryManager
+            .fetchQuery(this.queryId, combinedOptions, exports.FetchType.refetch)
+            .then(function (result) { return apolloUtilities.maybeDeepFreeze(result); });
+    };
+    ObservableQuery.prototype.fetchMore = function (fetchMoreOptions) {
+        var _this = this;
+        if (!fetchMoreOptions.updateQuery) {
+            throw new Error('updateQuery option is required. This function defines how to update the query data with the new results.');
+        }
+        return Promise.resolve()
+            .then(function () {
+            var qid = _this.queryManager.generateQueryId();
+            var combinedOptions;
+            if (fetchMoreOptions.query) {
+                combinedOptions = fetchMoreOptions;
+            }
+            else {
+                combinedOptions = __assign({}, _this.options, fetchMoreOptions, { variables: __assign({}, _this.variables, fetchMoreOptions.variables) });
+            }
+            combinedOptions.fetchPolicy = 'network-only';
+            return _this.queryManager.fetchQuery(qid, combinedOptions, exports.FetchType.normal, _this.queryId);
+        })
+            .then(function (fetchMoreResult) {
+            _this.updateQuery(function (previousResult, _a) {
+                var variables = _a.variables;
+                return fetchMoreOptions.updateQuery(previousResult, {
+                    fetchMoreResult: fetchMoreResult.data,
+                    variables: variables,
+                });
+            });
+            return fetchMoreResult;
+        });
+    };
+    ObservableQuery.prototype.subscribeToMore = function (options) {
+        var _this = this;
+        var subscription = this.queryManager
+            .startGraphQLSubscription({
+            query: options.document,
+            variables: options.variables,
+        })
+            .subscribe({
+            next: function (data) {
+                if (options.updateQuery) {
+                    _this.updateQuery(function (previous, _a) {
+                        var variables = _a.variables;
+                        return options.updateQuery(previous, {
+                            subscriptionData: data,
+                            variables: variables,
+                        });
+                    });
+                }
+            },
+            error: function (err) {
+                if (options.onError) {
+                    options.onError(err);
+                    return;
+                }
+                console.error('Unhandled GraphQL subscription error', err);
+            },
+        });
+        this.subscriptionHandles.push(subscription);
+        return function () {
+            var i = _this.subscriptionHandles.indexOf(subscription);
+            if (i >= 0) {
+                _this.subscriptionHandles.splice(i, 1);
+                subscription.unsubscribe();
+            }
+        };
+    };
+    ObservableQuery.prototype.setOptions = function (opts) {
+        var oldOptions = this.options;
+        this.options = __assign({}, this.options, opts);
+        if (opts.pollInterval) {
+            this.startPolling(opts.pollInterval);
+        }
+        else if (opts.pollInterval === 0) {
+            this.stopPolling();
+        }
+        var tryFetch = (oldOptions.fetchPolicy !== 'network-only' &&
+            opts.fetchPolicy === 'network-only') ||
+            (oldOptions.fetchPolicy === 'cache-only' &&
+                opts.fetchPolicy !== 'cache-only') ||
+            (oldOptions.fetchPolicy === 'standby' &&
+                opts.fetchPolicy !== 'standby') ||
+            false;
+        return this.setVariables(this.options.variables, tryFetch, opts.fetchResults);
+    };
+    ObservableQuery.prototype.setVariables = function (variables, tryFetch, fetchResults) {
+        if (tryFetch === void 0) { tryFetch = false; }
+        if (fetchResults === void 0) { fetchResults = true; }
+        this.isTornDown = false;
+        var newVariables = __assign({}, this.variables, variables);
+        if (apolloUtilities.isEqual(newVariables, this.variables) && !tryFetch) {
+            if (this.observers.length === 0 || !fetchResults) {
+                return new Promise(function (resolve) { return resolve(); });
+            }
+            return this.result();
+        }
+        else {
+            this.lastVariables = this.variables;
+            this.variables = newVariables;
+            this.options.variables = newVariables;
+            if (this.observers.length === 0) {
+                return new Promise(function (resolve) { return resolve(); });
+            }
+            return this.queryManager
+                .fetchQuery(this.queryId, __assign({}, this.options, { variables: this.variables }))
+                .then(function (result) { return apolloUtilities.maybeDeepFreeze(result); });
+        }
+    };
+    ObservableQuery.prototype.updateQuery = function (mapFn) {
+        var _a = this.queryManager.getQueryWithPreviousResult(this.queryId), previousResult = _a.previousResult, variables = _a.variables, document = _a.document;
+        var newResult = apolloUtilities.tryFunctionOrLogError(function () {
+            return mapFn(previousResult, { variables: variables });
+        });
+        if (newResult) {
+            this.queryManager.dataStore.markUpdateQueryResult(document, variables, newResult);
+            this.queryManager.broadcastQueries();
+        }
+    };
+    ObservableQuery.prototype.stopPolling = function () {
+        if (this.isCurrentlyPolling) {
+            this.scheduler.stopPollingQuery(this.queryId);
+            this.options.pollInterval = undefined;
+            this.isCurrentlyPolling = false;
+        }
+    };
+    ObservableQuery.prototype.startPolling = function (pollInterval) {
+        if (this.options.fetchPolicy === 'cache-first' ||
+            this.options.fetchPolicy === 'cache-only') {
+            throw new Error('Queries that specify the cache-first and cache-only fetchPolicies cannot also be polling queries.');
+        }
+        if (this.isCurrentlyPolling) {
+            this.scheduler.stopPollingQuery(this.queryId);
+            this.isCurrentlyPolling = false;
+        }
+        this.options.pollInterval = pollInterval;
+        this.isCurrentlyPolling = true;
+        this.scheduler.startPollingQuery(this.options, this.queryId);
+    };
+    ObservableQuery.prototype.onSubscribe = function (observer) {
+        var _this = this;
+        if (observer._subscription &&
+            observer._subscription._observer &&
+            !observer._subscription._observer.error) {
+            observer._subscription._observer.error = function (error) {
+                console.error('Unhandled error', error.message, error.stack);
+            };
+        }
+        this.observers.push(observer);
+        if (observer.next && this.lastResult)
+            observer.next(this.lastResult);
+        if (observer.error && this.lastError)
+            observer.error(this.lastError);
+        if (this.observers.length === 1)
+            this.setUpQuery();
+        return function () {
+            _this.observers = _this.observers.filter(function (obs) { return obs !== observer; });
+            if (_this.observers.length === 0) {
+                _this.tearDownQuery();
+            }
+        };
+    };
+    ObservableQuery.prototype.setUpQuery = function () {
+        var _this = this;
+        if (this.shouldSubscribe) {
+            this.queryManager.addObservableQuery(this.queryId, this);
+        }
+        if (!!this.options.pollInterval) {
+            if (this.options.fetchPolicy === 'cache-first' ||
+                this.options.fetchPolicy === 'cache-only') {
+                throw new Error('Queries that specify the cache-first and cache-only fetchPolicies cannot also be polling queries.');
+            }
+            this.isCurrentlyPolling = true;
+            this.scheduler.startPollingQuery(this.options, this.queryId);
+        }
+        var observer = {
+            next: function (result) {
+                _this.lastResult = result;
+                _this.observers.forEach(function (obs) { return obs.next && obs.next(result); });
+            },
+            error: function (error) {
+                _this.lastError = error;
+                _this.observers.forEach(function (obs) { return obs.error && obs.error(error); });
+            },
+        };
+        this.queryManager.startQuery(this.queryId, this.options, this.queryManager.queryListenerForObserver(this.queryId, this.options, observer));
+    };
+    ObservableQuery.prototype.tearDownQuery = function () {
+        this.isTornDown = true;
+        if (this.isCurrentlyPolling) {
+            this.scheduler.stopPollingQuery(this.queryId);
+            this.isCurrentlyPolling = false;
+        }
+        this.subscriptionHandles.forEach(function (sub) { return sub.unsubscribe(); });
+        this.subscriptionHandles = [];
+        this.queryManager.removeObservableQuery(this.queryId);
+        this.queryManager.stopQuery(this.queryId);
+        this.observers = [];
+    };
+    return ObservableQuery;
+}(Observable$1));
+
+var __assign$3 = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var QueryScheduler = (function () {
+    function QueryScheduler(_a) {
+        var queryManager = _a.queryManager, ssrMode = _a.ssrMode;
+        this.inFlightQueries = {};
+        this.registeredQueries = {};
+        this.intervalQueries = {};
+        this.pollingTimers = {};
+        this.ssrMode = false;
+        this.queryManager = queryManager;
+        this.ssrMode = ssrMode || false;
+    }
+    QueryScheduler.prototype.checkInFlight = function (queryId) {
+        var query = this.queryManager.queryStore.get(queryId);
+        return (query &&
+            query.networkStatus !== exports.NetworkStatus.ready &&
+            query.networkStatus !== exports.NetworkStatus.error);
+    };
+    QueryScheduler.prototype.fetchQuery = function (queryId, options, fetchType) {
+        var _this = this;
+        return new Promise(function (resolve, reject) {
+            _this.queryManager
+                .fetchQuery(queryId, options, fetchType)
+                .then(function (result) {
+                resolve(result);
+            })
+                .catch(function (error) {
+                reject(error);
+            });
+        });
+    };
+    QueryScheduler.prototype.startPollingQuery = function (options, queryId, listener) {
+        if (!options.pollInterval) {
+            throw new Error('Attempted to start a polling query without a polling interval.');
+        }
+        if (this.ssrMode)
+            return queryId;
+        this.registeredQueries[queryId] = options;
+        if (listener) {
+            this.queryManager.addQueryListener(queryId, listener);
+        }
+        this.addQueryOnInterval(queryId, options);
+        return queryId;
+    };
+    QueryScheduler.prototype.stopPollingQuery = function (queryId) {
+        delete this.registeredQueries[queryId];
+    };
+    QueryScheduler.prototype.fetchQueriesOnInterval = function (interval) {
+        var _this = this;
+        this.intervalQueries[interval] = this.intervalQueries[interval].filter(function (queryId) {
+            if (!(_this.registeredQueries.hasOwnProperty(queryId) &&
+                _this.registeredQueries[queryId].pollInterval === interval)) {
+                return false;
+            }
+            if (_this.checkInFlight(queryId)) {
+                return true;
+            }
+            var queryOptions = _this.registeredQueries[queryId];
+            var pollingOptions = __assign$3({}, queryOptions);
+            pollingOptions.fetchPolicy = 'network-only';
+            _this.fetchQuery(queryId, pollingOptions, exports.FetchType.poll).catch(function () { });
+            return true;
+        });
+        if (this.intervalQueries[interval].length === 0) {
+            clearInterval(this.pollingTimers[interval]);
+            delete this.intervalQueries[interval];
+        }
+    };
+    QueryScheduler.prototype.addQueryOnInterval = function (queryId, queryOptions) {
+        var _this = this;
+        var interval = queryOptions.pollInterval;
+        if (!interval) {
+            throw new Error("A poll interval is required to start polling query with id '" + queryId + "'.");
+        }
+        if (this.intervalQueries.hasOwnProperty(interval.toString()) &&
+            this.intervalQueries[interval].length > 0) {
+            this.intervalQueries[interval].push(queryId);
+        }
+        else {
+            this.intervalQueries[interval] = [queryId];
+            this.pollingTimers[interval] = setInterval(function () {
+                _this.fetchQueriesOnInterval(interval);
+            }, interval);
+        }
+    };
+    QueryScheduler.prototype.registerPollingQuery = function (queryOptions) {
+        if (!queryOptions.pollInterval) {
+            throw new Error('Attempted to register a non-polling query with the scheduler.');
+        }
+        return new ObservableQuery({
+            scheduler: this,
+            options: queryOptions,
+        });
+    };
+    return QueryScheduler;
+}());
+
+var MutationStore = (function () {
+    function MutationStore() {
+        this.store = {};
+    }
+    MutationStore.prototype.getStore = function () {
+        return this.store;
+    };
+    MutationStore.prototype.get = function (mutationId) {
+        return this.store[mutationId];
+    };
+    MutationStore.prototype.initMutation = function (mutationId, mutationString, variables) {
+        this.store[mutationId] = {
+            mutationString: mutationString,
+            variables: variables || {},
+            loading: true,
+            error: null,
+        };
+    };
+    MutationStore.prototype.markMutationError = function (mutationId, error) {
+        this.store[mutationId].loading = false;
+        this.store[mutationId].error = error;
+    };
+    MutationStore.prototype.markMutationResult = function (mutationId) {
+        this.store[mutationId].loading = false;
+        this.store[mutationId].error = null;
+    };
+    MutationStore.prototype.reset = function () {
+        this.store = {};
+    };
+    return MutationStore;
+}());
+
+var __assign$4 = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var QueryStore = (function () {
+    function QueryStore() {
+        this.store = {};
+    }
+    QueryStore.prototype.getStore = function () {
+        return this.store;
+    };
+    QueryStore.prototype.get = function (queryId) {
+        return this.store[queryId];
+    };
+    QueryStore.prototype.initQuery = function (query) {
+        var previousQuery = this.store[query.queryId];
+        if (previousQuery && previousQuery.queryString !== query.queryString) {
+            throw new Error('Internal Error: may not update existing query string in store');
+        }
+        var isSetVariables = false;
+        var previousVariables = null;
+        if (query.storePreviousVariables &&
+            previousQuery &&
+            previousQuery.networkStatus !== exports.NetworkStatus.loading) {
+            if (!apolloUtilities.isEqual(previousQuery.variables, query.variables)) {
+                isSetVariables = true;
+                previousVariables = previousQuery.variables;
+            }
+        }
+        var networkStatus;
+        if (isSetVariables) {
+            networkStatus = exports.NetworkStatus.setVariables;
+        }
+        else if (query.isPoll) {
+            networkStatus = exports.NetworkStatus.poll;
+        }
+        else if (query.isRefetch) {
+            networkStatus = exports.NetworkStatus.refetch;
+        }
+        else {
+            networkStatus = exports.NetworkStatus.loading;
+        }
+        var graphQLErrors = [];
+        if (previousQuery && previousQuery.graphQLErrors) {
+            graphQLErrors = previousQuery.graphQLErrors;
+        }
+        this.store[query.queryId] = {
+            queryString: query.queryString,
+            document: query.document,
+            variables: query.variables,
+            previousVariables: previousVariables,
+            networkError: null,
+            graphQLErrors: graphQLErrors,
+            networkStatus: networkStatus,
+            metadata: query.metadata,
+        };
+        if (typeof query.fetchMoreForQueryId === 'string') {
+            this.store[query.fetchMoreForQueryId].networkStatus =
+                exports.NetworkStatus.fetchMore;
+        }
+    };
+    QueryStore.prototype.markQueryResult = function (queryId, result, fetchMoreForQueryId) {
+        if (!this.store[queryId])
+            return;
+        this.store[queryId].networkError = null;
+        this.store[queryId].graphQLErrors =
+            result.errors && result.errors.length ? result.errors : [];
+        this.store[queryId].previousVariables = null;
+        this.store[queryId].networkStatus = exports.NetworkStatus.ready;
+        if (typeof fetchMoreForQueryId === 'string') {
+            this.store[fetchMoreForQueryId].networkStatus = exports.NetworkStatus.ready;
+        }
+    };
+    QueryStore.prototype.markQueryError = function (queryId, error, fetchMoreForQueryId) {
+        if (!this.store[queryId])
+            return;
+        this.store[queryId].networkError = error;
+        this.store[queryId].networkStatus = exports.NetworkStatus.error;
+        if (typeof fetchMoreForQueryId === 'string') {
+            this.markQueryError(fetchMoreForQueryId, error, undefined);
+        }
+    };
+    QueryStore.prototype.markQueryResultClient = function (queryId, complete) {
+        if (!this.store[queryId])
+            return;
+        this.store[queryId].networkError = null;
+        this.store[queryId].previousVariables = null;
+        this.store[queryId].networkStatus = complete
+            ? exports.NetworkStatus.ready
+            : exports.NetworkStatus.loading;
+    };
+    QueryStore.prototype.stopQuery = function (queryId) {
+        delete this.store[queryId];
+    };
+    QueryStore.prototype.reset = function (observableQueryIds) {
+        var _this = this;
+        this.store = Object.keys(this.store)
+            .filter(function (queryId) {
+            return observableQueryIds.indexOf(queryId) > -1;
+        })
+            .reduce(function (res, key) {
+            res[key] = __assign$4({}, _this.store[key], { networkStatus: exports.NetworkStatus.loading });
+            return res;
+        }, {});
+    };
+    return QueryStore;
+}());
+
+var __assign$2 = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var defaultQueryInfo = {
+    listeners: [],
+    invalidated: false,
+    document: null,
+    newData: null,
+    lastRequestId: null,
+    observableQuery: null,
+    subscriptions: [],
+};
+var QueryManager = (function () {
+    function QueryManager(_a) {
+        var link = _a.link, _b = _a.queryDeduplication, queryDeduplication = _b === void 0 ? false : _b, store = _a.store, _c = _a.onBroadcast, onBroadcast = _c === void 0 ? function () { return undefined; } : _c, _d = _a.ssrMode, ssrMode = _d === void 0 ? false : _d;
+        this.mutationStore = new MutationStore();
+        this.queryStore = new QueryStore();
+        this.idCounter = 1;
+        this.queries = new Map();
+        this.fetchQueryPromises = new Map();
+        this.queryIdsByName = {};
+        this.link = link;
+        this.deduplicator = apolloLink.ApolloLink.from([new apolloLinkDedup.DedupLink(), link]);
+        this.queryDeduplication = queryDeduplication;
+        this.dataStore = store;
+        this.onBroadcast = onBroadcast;
+        this.scheduler = new QueryScheduler({ queryManager: this, ssrMode: ssrMode });
+    }
+    QueryManager.prototype.mutate = function (_a) {
+        var _this = this;
+        var mutation = _a.mutation, variables = _a.variables, optimisticResponse = _a.optimisticResponse, updateQueriesByName = _a.updateQueries, _b = _a.refetchQueries, refetchQueries = _b === void 0 ? [] : _b, updateWithProxyFn = _a.update, _c = _a.errorPolicy, errorPolicy = _c === void 0 ? 'none' : _c, _d = _a.context, context = _d === void 0 ? {} : _d;
+        if (!mutation) {
+            throw new Error('mutation option is required. You must specify your GraphQL document in the mutation option.');
+        }
+        var mutationId = this.generateQueryId();
+        var cache = this.dataStore.getCache();
+        mutation = cache.transformDocument(mutation), variables = apolloUtilities.assign({}, apolloUtilities.getDefaultValues(apolloUtilities.getMutationDefinition(mutation)), variables);
+        var mutationString = printer.print(mutation);
+        var request = {
+            query: mutation,
+            variables: variables,
+            operationName: apolloUtilities.getOperationName(mutation) || undefined,
+            context: context,
+        };
+        this.setQuery(mutationId, function () { return ({ document: mutation }); });
+        var generateUpdateQueriesInfo = function () {
+            var ret = {};
+            if (updateQueriesByName) {
+                Object.keys(updateQueriesByName).forEach(function (queryName) {
+                    return (_this.queryIdsByName[queryName] || []).forEach(function (queryId) {
+                        ret[queryId] = {
+                            updater: updateQueriesByName[queryName],
+                            query: _this.queryStore.get(queryId),
+                        };
+                    });
+                });
+            }
+            return ret;
+        };
+        this.mutationStore.initMutation(mutationId, mutationString, variables);
+        this.dataStore.markMutationInit({
+            mutationId: mutationId,
+            document: mutation,
+            variables: variables || {},
+            updateQueries: generateUpdateQueriesInfo(),
+            update: updateWithProxyFn,
+            optimisticResponse: optimisticResponse,
+        });
+        this.broadcastQueries();
+        return new Promise(function (resolve, reject) {
+            var storeResult;
+            var error;
+            var newRequest = __assign$2({ context: {} }, request, { query: cache.transformForLink
+                    ? cache.transformForLink(request.query)
+                    : request.query });
+            newRequest.context.cache = _this.dataStore.getCache();
+            apolloLink.execute(_this.link, newRequest).subscribe({
+                next: function (result) {
+                    if (result.errors && errorPolicy === 'none') {
+                        error = new ApolloError({
+                            graphQLErrors: result.errors,
+                        });
+                        return;
+                    }
+                    _this.mutationStore.markMutationResult(mutationId);
+                    _this.dataStore.markMutationResult({
+                        mutationId: mutationId,
+                        result: result,
+                        document: mutation,
+                        variables: variables || {},
+                        updateQueries: generateUpdateQueriesInfo(),
+                        update: updateWithProxyFn,
+                    });
+                    storeResult = result;
+                },
+                error: function (err) {
+                    _this.mutationStore.markMutationError(mutationId, err);
+                    _this.dataStore.markMutationComplete({
+                        mutationId: mutationId,
+                        optimisticResponse: optimisticResponse,
+                    });
+                    _this.broadcastQueries();
+                    _this.setQuery(mutationId, function () { return ({ document: undefined }); });
+                    reject(new ApolloError({
+                        networkError: err,
+                    }));
+                },
+                complete: function () {
+                    if (error) {
+                        _this.mutationStore.markMutationError(mutationId, error);
+                    }
+                    _this.dataStore.markMutationComplete({
+                        mutationId: mutationId,
+                        optimisticResponse: optimisticResponse,
+                    });
+                    _this.broadcastQueries();
+                    if (error) {
+                        reject(error);
+                        return;
+                    }
+                    if (typeof refetchQueries === 'function')
+                        refetchQueries = refetchQueries(storeResult);
+                    refetchQueries.forEach(function (refetchQuery) {
+                        if (typeof refetchQuery === 'string') {
+                            _this.refetchQueryByName(refetchQuery);
+                            return;
+                        }
+                        _this.query({
+                            query: refetchQuery.query,
+                            variables: refetchQuery.variables,
+                            fetchPolicy: 'network-only',
+                        });
+                    });
+                    _this.setQuery(mutationId, function () { return ({ document: undefined }); });
+                    if (errorPolicy === 'ignore' && storeResult && storeResult.errors) {
+                        delete storeResult.errors;
+                    }
+                    resolve(storeResult);
+                },
+            });
+        });
+    };
+    QueryManager.prototype.fetchQuery = function (queryId, options, fetchType, fetchMoreForQueryId) {
+        var _this = this;
+        var _a = options.variables, variables = _a === void 0 ? {} : _a, _b = options.metadata, metadata = _b === void 0 ? null : _b, _c = options.fetchPolicy, fetchPolicy = _c === void 0 ? 'cache-first' : _c;
+        var cache = this.dataStore.getCache();
+        var query = cache.transformDocument(options.query);
+        var storeResult;
+        var needToFetch = fetchPolicy === 'network-only';
+        if (fetchType !== exports.FetchType.refetch && fetchPolicy !== 'network-only') {
+            var _d = this.dataStore.getCache().diff({
+                query: query,
+                variables: variables,
+                returnPartialData: true,
+                optimistic: false,
+            }), complete = _d.complete, result = _d.result;
+            needToFetch = !complete || fetchPolicy === 'cache-and-network';
+            storeResult = result;
+        }
+        var shouldFetch = needToFetch && fetchPolicy !== 'cache-only' && fetchPolicy !== 'standby';
+        if (apolloUtilities.hasDirectives(['live'], query))
+            shouldFetch = true;
+        var requestId = this.generateRequestId();
+        var cancel = this.updateQueryWatch(queryId, query, options);
+        this.setQuery(queryId, function () { return ({
+            document: query,
+            lastRequestId: requestId,
+            invalidated: true,
+            cancel: cancel,
+        }); });
+        this.invalidate(true, fetchMoreForQueryId);
+        this.queryStore.initQuery({
+            queryId: queryId,
+            queryString: printer.print(query),
+            document: query,
+            storePreviousVariables: shouldFetch,
+            variables: variables,
+            isPoll: fetchType === exports.FetchType.poll,
+            isRefetch: fetchType === exports.FetchType.refetch,
+            metadata: metadata,
+            fetchMoreForQueryId: fetchMoreForQueryId,
+        });
+        this.broadcastQueries();
+        var shouldDispatchClientResult = !shouldFetch || fetchPolicy === 'cache-and-network';
+        if (shouldDispatchClientResult) {
+            this.queryStore.markQueryResultClient(queryId, !shouldFetch);
+            this.invalidate(true, queryId, fetchMoreForQueryId);
+            this.broadcastQueries();
+        }
+        if (shouldFetch) {
+            var networkResult = this.fetchRequest({
+                requestId: requestId,
+                queryId: queryId,
+                document: cache.transformForLink
+                    ? cache.transformForLink(query)
+                    : query,
+                options: options,
+                fetchMoreForQueryId: fetchMoreForQueryId,
+            }).catch(function (error) {
+                if (isApolloError(error)) {
+                    throw error;
+                }
+                else {
+                    var lastRequestId = _this.getQuery(queryId).lastRequestId;
+                    if (requestId >= (lastRequestId || 1)) {
+                        _this.queryStore.markQueryError(queryId, error, fetchMoreForQueryId);
+                        _this.invalidate(true, queryId, fetchMoreForQueryId);
+                        _this.broadcastQueries();
+                    }
+                    _this.removeFetchQueryPromise(requestId);
+                    throw new ApolloError({ networkError: error });
+                }
+            });
+            if (fetchPolicy !== 'cache-and-network') {
+                return networkResult;
+            }
+            else {
+                networkResult.catch(function () { });
+            }
+        }
+        return Promise.resolve({ data: storeResult });
+    };
+    QueryManager.prototype.queryListenerForObserver = function (queryId, options, observer) {
+        var _this = this;
+        var previouslyHadError = false;
+        return function (queryStoreValue, newData) {
+            _this.invalidate(false, queryId);
+            if (!queryStoreValue)
+                return;
+            var observableQuery = _this.getQuery(queryId).observableQuery;
+            var fetchPolicy = observableQuery
+                ? observableQuery.options.fetchPolicy
+                : options.fetchPolicy;
+            if (fetchPolicy === 'standby')
+                return;
+            var errorPolicy = observableQuery
+                ? observableQuery.options.errorPolicy
+                : options.errorPolicy;
+            var lastResult = observableQuery
+                ? observableQuery.getLastResult()
+                : null;
+            var lastError = observableQuery ? observableQuery.getLastError() : null;
+            var shouldNotifyIfLoading = (!newData && queryStoreValue.previousVariables != null) ||
+                fetchPolicy === 'cache-only' ||
+                fetchPolicy === 'cache-and-network';
+            var networkStatusChanged = Boolean(lastResult &&
+                queryStoreValue.networkStatus !== lastResult.networkStatus);
+            var errorStatusChanged = errorPolicy &&
+                (lastError && lastError.graphQLErrors) !==
+                    queryStoreValue.graphQLErrors &&
+                errorPolicy !== 'none';
+            if (!isNetworkRequestInFlight(queryStoreValue.networkStatus) ||
+                (networkStatusChanged && options.notifyOnNetworkStatusChange) ||
+                shouldNotifyIfLoading) {
+                if (((!errorPolicy || errorPolicy === 'none') &&
+                    queryStoreValue.graphQLErrors &&
+                    queryStoreValue.graphQLErrors.length > 0) ||
+                    queryStoreValue.networkError) {
+                    var apolloError_1 = new ApolloError({
+                        graphQLErrors: queryStoreValue.graphQLErrors,
+                        networkError: queryStoreValue.networkError,
+                    });
+                    previouslyHadError = true;
+                    if (observer.error) {
+                        try {
+                            observer.error(apolloError_1);
+                        }
+                        catch (e) {
+                            setTimeout(function () {
+                                throw e;
+                            }, 0);
+                        }
+                    }
+                    else {
+                        setTimeout(function () {
+                            throw apolloError_1;
+                        }, 0);
+                        if (!apolloUtilities.isProduction()) {
+                            console.info('An unhandled error was thrown because no error handler is registered ' +
+                                'for the query ' +
+                                queryStoreValue.queryString);
+                        }
+                    }
+                    return;
+                }
+                try {
+                    var data = void 0;
+                    var isMissing = void 0;
+                    if (newData) {
+                        _this.setQuery(queryId, function () { return ({ newData: null }); });
+                        data = newData.result;
+                        isMissing = !newData.complete ? !newData.complete : false;
+                    }
+                    else {
+                        if (lastResult && lastResult.data && !errorStatusChanged) {
+                            data = lastResult.data;
+                            isMissing = false;
+                        }
+                        else {
+                            var document_1 = _this.getQuery(queryId).document;
+                            var readResult = _this.dataStore.getCache().diff({
+                                query: document_1,
+                                variables: queryStoreValue.previousVariables ||
+                                    queryStoreValue.variables,
+                                optimistic: true,
+                            });
+                            data = readResult.result;
+                            isMissing = !readResult.complete;
+                        }
+                    }
+                    var resultFromStore = void 0;
+                    if (isMissing && fetchPolicy !== 'cache-only') {
+                        resultFromStore = {
+                            data: lastResult && lastResult.data,
+                            loading: isNetworkRequestInFlight(queryStoreValue.networkStatus),
+                            networkStatus: queryStoreValue.networkStatus,
+                            stale: true,
+                        };
+                    }
+                    else {
+                        resultFromStore = {
+                            data: data,
+                            loading: isNetworkRequestInFlight(queryStoreValue.networkStatus),
+                            networkStatus: queryStoreValue.networkStatus,
+                            stale: false,
+                        };
+                    }
+                    if (errorPolicy === 'all' &&
+                        queryStoreValue.graphQLErrors &&
+                        queryStoreValue.graphQLErrors.length > 0) {
+                        resultFromStore.errors = queryStoreValue.graphQLErrors;
+                    }
+                    if (observer.next) {
+                        var isDifferentResult = !(lastResult &&
+                            resultFromStore &&
+                            lastResult.networkStatus === resultFromStore.networkStatus &&
+                            lastResult.stale === resultFromStore.stale &&
+                            lastResult.data === resultFromStore.data);
+                        if (isDifferentResult || previouslyHadError) {
+                            try {
+                                observer.next(apolloUtilities.maybeDeepFreeze(resultFromStore));
+                            }
+                            catch (e) {
+                                setTimeout(function () {
+                                    throw e;
+                                }, 0);
+                            }
+                        }
+                    }
+                    previouslyHadError = false;
+                }
+                catch (error) {
+                    previouslyHadError = true;
+                    if (observer.error)
+                        observer.error(new ApolloError({ networkError: error }));
+                    return;
+                }
+            }
+        };
+    };
+    QueryManager.prototype.watchQuery = function (options, shouldSubscribe) {
+        if (shouldSubscribe === void 0) { shouldSubscribe = true; }
+        if (options.fetchPolicy === 'standby') {
+            throw new Error('client.watchQuery cannot be called with fetchPolicy set to "standby"');
+        }
+        var queryDefinition = apolloUtilities.getQueryDefinition(options.query);
+        if (queryDefinition.variableDefinitions &&
+            queryDefinition.variableDefinitions.length) {
+            var defaultValues = apolloUtilities.getDefaultValues(queryDefinition);
+            options.variables = apolloUtilities.assign({}, defaultValues, options.variables);
+        }
+        if (typeof options.notifyOnNetworkStatusChange === 'undefined') {
+            options.notifyOnNetworkStatusChange = false;
+        }
+        var transformedOptions = __assign$2({}, options);
+        return new ObservableQuery({
+            scheduler: this.scheduler,
+            options: transformedOptions,
+            shouldSubscribe: shouldSubscribe,
+        });
+    };
+    QueryManager.prototype.query = function (options) {
+        var _this = this;
+        if (!options.query) {
+            throw new Error('query option is required. You must specify your GraphQL document in the query option.');
+        }
+        if (options.query.kind !== 'Document') {
+            throw new Error('You must wrap the query string in a "gql" tag.');
+        }
+        if (options.returnPartialData) {
+            throw new Error('returnPartialData option only supported on watchQuery.');
+        }
+        if (options.pollInterval) {
+            throw new Error('pollInterval option only supported on watchQuery.');
+        }
+        if (typeof options.notifyOnNetworkStatusChange !== 'undefined') {
+            throw new Error('Cannot call "query" with "notifyOnNetworkStatusChange" option. Only "watchQuery" has that option.');
+        }
+        options.notifyOnNetworkStatusChange = false;
+        var requestId = this.idCounter;
+        var resPromise = new Promise(function (resolve, reject) {
+            _this.addFetchQueryPromise(requestId, resPromise, resolve, reject);
+            return _this.watchQuery(options, false)
+                .result()
+                .then(function (result) {
+                _this.removeFetchQueryPromise(requestId);
+                resolve(result);
+            })
+                .catch(function (error) {
+                _this.removeFetchQueryPromise(requestId);
+                reject(error);
+            });
+        });
+        return resPromise;
+    };
+    QueryManager.prototype.generateQueryId = function () {
+        var queryId = this.idCounter.toString();
+        this.idCounter++;
+        return queryId;
+    };
+    QueryManager.prototype.stopQueryInStore = function (queryId) {
+        this.queryStore.stopQuery(queryId);
+        this.invalidate(true, queryId);
+        this.broadcastQueries();
+    };
+    QueryManager.prototype.addQueryListener = function (queryId, listener) {
+        this.setQuery(queryId, function (_a) {
+            var _b = _a.listeners, listeners = _b === void 0 ? [] : _b;
+            return ({
+                listeners: listeners.concat([listener]),
+                invalidate: false,
+            });
+        });
+    };
+    QueryManager.prototype.updateQueryWatch = function (queryId, document, options) {
+        var _this = this;
+        var cancel = this.getQuery(queryId).cancel;
+        if (cancel)
+            cancel();
+        var previousResult = function () {
+            var previousResult = null;
+            var observableQuery = _this.getQuery(queryId).observableQuery;
+            if (observableQuery) {
+                var lastResult = observableQuery.getLastResult();
+                if (lastResult) {
+                    previousResult = lastResult.data;
+                }
+            }
+            return previousResult;
+        };
+        return this.dataStore.getCache().watch({
+            query: document,
+            variables: options.variables,
+            optimistic: true,
+            previousResult: previousResult,
+            callback: function (newData) {
+                _this.setQuery(queryId, function () { return ({ invalidated: true, newData: newData }); });
+            },
+        });
+    };
+    QueryManager.prototype.addFetchQueryPromise = function (requestId, promise, resolve, reject) {
+        this.fetchQueryPromises.set(requestId.toString(), {
+            promise: promise,
+            resolve: resolve,
+            reject: reject,
+        });
+    };
+    QueryManager.prototype.removeFetchQueryPromise = function (requestId) {
+        this.fetchQueryPromises.delete(requestId.toString());
+    };
+    QueryManager.prototype.addObservableQuery = function (queryId, observableQuery) {
+        this.setQuery(queryId, function () { return ({ observableQuery: observableQuery }); });
+        var queryDef = apolloUtilities.getQueryDefinition(observableQuery.options.query);
+        if (queryDef.name && queryDef.name.value) {
+            var queryName = queryDef.name.value;
+            this.queryIdsByName[queryName] = this.queryIdsByName[queryName] || [];
+            this.queryIdsByName[queryName].push(observableQuery.queryId);
+        }
+    };
+    QueryManager.prototype.removeObservableQuery = function (queryId) {
+        var _a = this.getQuery(queryId), observableQuery = _a.observableQuery, cancel = _a.cancel;
+        if (cancel)
+            cancel();
+        if (!observableQuery)
+            return;
+        var definition = apolloUtilities.getQueryDefinition(observableQuery.options.query);
+        var queryName = definition.name ? definition.name.value : null;
+        this.setQuery(queryId, function () { return ({ observableQuery: null }); });
+        if (queryName) {
+            this.queryIdsByName[queryName] = this.queryIdsByName[queryName].filter(function (val) {
+                return !(observableQuery.queryId === val);
+            });
+        }
+    };
+    QueryManager.prototype.resetStore = function () {
+        this.fetchQueryPromises.forEach(function (_a) {
+            var reject = _a.reject;
+            reject(new Error('Store reset while query was in flight.'));
+        });
+        var resetIds = [];
+        this.queries.forEach(function (_a, queryId) {
+            var observableQuery = _a.observableQuery;
+            if (observableQuery)
+                resetIds.push(queryId);
+        });
+        this.queryStore.reset(resetIds);
+        this.mutationStore.reset();
+        var dataStoreReset = this.dataStore.reset();
+        var observableQueryPromises = this.getObservableQueryPromises();
+        this.broadcastQueries();
+        return dataStoreReset.then(function () { return Promise.all(observableQueryPromises); });
+    };
+    QueryManager.prototype.getObservableQueryPromises = function () {
+        var _this = this;
+        var observableQueryPromises = [];
+        this.queries.forEach(function (_a, queryId) {
+            var observableQuery = _a.observableQuery;
+            if (!observableQuery)
+                return;
+            var fetchPolicy = observableQuery.options.fetchPolicy;
+            observableQuery.resetLastResults();
+            if (fetchPolicy !== 'cache-only' && fetchPolicy !== 'standby') {
+                observableQueryPromises.push(observableQuery.refetch());
+            }
+            _this.setQuery(queryId, function () { return ({ newData: null }); });
+            _this.invalidate(true, queryId);
+        });
+        return observableQueryPromises;
+    };
+    QueryManager.prototype.reFetchObservableQueries = function () {
+        var observableQueryPromises = this.getObservableQueryPromises();
+        this.broadcastQueries();
+        return Promise.all(observableQueryPromises);
+    };
+    QueryManager.prototype.startQuery = function (queryId, options, listener) {
+        this.addQueryListener(queryId, listener);
+        this.fetchQuery(queryId, options)
+            .catch(function () { return undefined; });
+        return queryId;
+    };
+    QueryManager.prototype.startGraphQLSubscription = function (options) {
+        var _this = this;
+        var query = options.query;
+        var cache = this.dataStore.getCache();
+        var transformedDoc = cache.transformDocument(query);
+        var variables = apolloUtilities.assign({}, apolloUtilities.getDefaultValues(apolloUtilities.getOperationDefinition(query)), options.variables);
+        var request = {
+            query: transformedDoc,
+            variables: variables,
+            operationName: apolloUtilities.getOperationName(transformedDoc) || undefined,
+        };
+        var sub;
+        var observers = [];
+        return new Observable$1(function (observer) {
+            observers.push(observer);
+            if (observers.length === 1) {
+                var handler = {
+                    next: function (result) {
+                        _this.dataStore.markSubscriptionResult(result, transformedDoc, variables);
+                        _this.broadcastQueries();
+                        observers.forEach(function (obs) {
+                            if (obs.next)
+                                obs.next(result);
+                        });
+                    },
+                    error: function (error) {
+                        observers.forEach(function (obs) {
+                            if (obs.error)
+                                obs.error(error);
+                        });
+                    },
+                };
+                var newRequest = __assign$2({}, request, { query: cache.transformForLink
+                        ? cache.transformForLink(request.query)
+                        : request.query });
+                sub = apolloLink.execute(_this.link, newRequest).subscribe(handler);
+            }
+            return function () {
+                observers = observers.filter(function (obs) { return obs !== observer; });
+                if (observers.length === 0 && sub) {
+                    sub.unsubscribe();
+                }
+            };
+        });
+    };
+    QueryManager.prototype.stopQuery = function (queryId) {
+        this.removeQuery(queryId);
+        this.stopQueryInStore(queryId);
+    };
+    QueryManager.prototype.removeQuery = function (queryId) {
+        var subscriptions = this.getQuery(queryId).subscriptions;
+        subscriptions.forEach(function (x) { return x.unsubscribe(); });
+        this.queries.delete(queryId);
+    };
+    QueryManager.prototype.getCurrentQueryResult = function (observableQuery) {
+        var _a = observableQuery.options, variables = _a.variables, query = _a.query;
+        var lastResult = observableQuery.getLastResult();
+        var newData = this.getQuery(observableQuery.queryId).newData;
+        if (newData) {
+            return apolloUtilities.maybeDeepFreeze({ data: newData.result, partial: false });
+        }
+        else {
+            try {
+                var data = this.dataStore.getCache().read({
+                    query: query,
+                    variables: variables,
+                    previousResult: lastResult ? lastResult.data : undefined,
+                    optimistic: true,
+                });
+                return apolloUtilities.maybeDeepFreeze({ data: data, partial: false });
+            }
+            catch (e) {
+                return apolloUtilities.maybeDeepFreeze({ data: {}, partial: true });
+            }
+        }
+    };
+    QueryManager.prototype.getQueryWithPreviousResult = function (queryIdOrObservable) {
+        var observableQuery;
+        if (typeof queryIdOrObservable === 'string') {
+            var foundObserveableQuery = this.getQuery(queryIdOrObservable).observableQuery;
+            if (!foundObserveableQuery) {
+                throw new Error("ObservableQuery with this id doesn't exist: " + queryIdOrObservable);
+            }
+            observableQuery = foundObserveableQuery;
+        }
+        else {
+            observableQuery = queryIdOrObservable;
+        }
+        var _a = observableQuery.options, variables = _a.variables, query = _a.query;
+        var data = this.getCurrentQueryResult(observableQuery).data;
+        return {
+            previousResult: data,
+            variables: variables,
+            document: query,
+        };
+    };
+    QueryManager.prototype.broadcastQueries = function () {
+        var _this = this;
+        this.onBroadcast();
+        this.queries.forEach(function (info, id) {
+            if (!info.invalidated || !info.listeners)
+                return;
+            info.listeners
+                .filter(function (x) { return !!x; })
+                .forEach(function (listener) {
+                listener(_this.queryStore.get(id), info.newData);
+            });
+        });
+    };
+    QueryManager.prototype.fetchRequest = function (_a) {
+        var _this = this;
+        var requestId = _a.requestId, queryId = _a.queryId, document = _a.document, options = _a.options, fetchMoreForQueryId = _a.fetchMoreForQueryId;
+        var variables = options.variables, context = options.context, _b = options.errorPolicy, errorPolicy = _b === void 0 ? 'none' : _b;
+        var request = {
+            query: document,
+            variables: variables,
+            operationName: apolloUtilities.getOperationName(document) || undefined,
+            context: context || {},
+        };
+        request.context.forceFetch = !this.queryDeduplication;
+        request.context.cache = this.dataStore.getCache();
+        var resultFromStore;
+        var errorsFromStore;
+        var retPromise = new Promise(function (resolve, reject) {
+            _this.addFetchQueryPromise(requestId, retPromise, resolve, reject);
+            var subscription = apolloLink.execute(_this.deduplicator, request).subscribe({
+                next: function (result) {
+                    var lastRequestId = _this.getQuery(queryId).lastRequestId;
+                    if (requestId >= (lastRequestId || 1)) {
+                        try {
+                            _this.dataStore.markQueryResult(result, document, variables, fetchMoreForQueryId, errorPolicy === 'ignore');
+                        }
+                        catch (e) {
+                            reject(e);
+                            return;
+                        }
+                        _this.queryStore.markQueryResult(queryId, result, fetchMoreForQueryId);
+                        _this.invalidate(true, queryId, fetchMoreForQueryId);
+                        _this.broadcastQueries();
+                    }
+                    if (result.errors && errorPolicy === 'none') {
+                        reject(new ApolloError({
+                            graphQLErrors: result.errors,
+                        }));
+                        return;
+                    }
+                    else if (errorPolicy === 'all') {
+                        errorsFromStore = result.errors;
+                    }
+                    if (fetchMoreForQueryId) {
+                        resultFromStore = result.data;
+                    }
+                    else {
+                        try {
+                            resultFromStore = _this.dataStore.getCache().read({
+                                variables: variables,
+                                query: document,
+                                optimistic: false,
+                            });
+                        }
+                        catch (e) { }
+                    }
+                },
+                error: function (error) {
+                    _this.removeFetchQueryPromise(requestId);
+                    _this.setQuery(queryId, function (_a) {
+                        var subscriptions = _a.subscriptions;
+                        return ({
+                            subscriptions: subscriptions.filter(function (x) { return x !== subscription; }),
+                        });
+                    });
+                    reject(error);
+                },
+                complete: function () {
+                    _this.removeFetchQueryPromise(requestId);
+                    _this.setQuery(queryId, function (_a) {
+                        var subscriptions = _a.subscriptions;
+                        return ({
+                            subscriptions: subscriptions.filter(function (x) { return x !== subscription; }),
+                        });
+                    });
+                    resolve({
+                        data: resultFromStore,
+                        errors: errorsFromStore,
+                        loading: false,
+                        networkStatus: exports.NetworkStatus.ready,
+                        stale: false,
+                    });
+                },
+            });
+            _this.setQuery(queryId, function (_a) {
+                var subscriptions = _a.subscriptions;
+                return ({
+                    subscriptions: subscriptions.concat([subscription]),
+                });
+            });
+        });
+        return retPromise;
+    };
+    QueryManager.prototype.refetchQueryByName = function (queryName) {
+        var _this = this;
+        var refetchedQueries = this.queryIdsByName[queryName];
+        if (refetchedQueries === undefined)
+            return;
+        return Promise.all(refetchedQueries
+            .map(function (id) { return _this.getQuery(id).observableQuery; })
+            .filter(function (x) { return !!x; })
+            .map(function (x) { return x.refetch(); }));
+    };
+    QueryManager.prototype.generateRequestId = function () {
+        var requestId = this.idCounter;
+        this.idCounter++;
+        return requestId;
+    };
+    QueryManager.prototype.getQuery = function (queryId) {
+        return this.queries.get(queryId) || __assign$2({}, defaultQueryInfo);
+    };
+    QueryManager.prototype.setQuery = function (queryId, updater) {
+        var prev = this.getQuery(queryId);
+        var newInfo = __assign$2({}, prev, updater(prev));
+        this.queries.set(queryId, newInfo);
+    };
+    QueryManager.prototype.invalidate = function (invalidated, queryId, fetchMoreForQueryId) {
+        if (queryId)
+            this.setQuery(queryId, function () { return ({ invalidated: invalidated }); });
+        if (fetchMoreForQueryId) {
+            this.setQuery(fetchMoreForQueryId, function () { return ({ invalidated: invalidated }); });
+        }
+    };
+    return QueryManager;
+}());
+
+var DataStore = (function () {
+    function DataStore(initialCache) {
+        this.cache = initialCache;
+    }
+    DataStore.prototype.getCache = function () {
+        return this.cache;
+    };
+    DataStore.prototype.markQueryResult = function (result, document, variables, fetchMoreForQueryId, ignoreErrors) {
+        if (ignoreErrors === void 0) { ignoreErrors = false; }
+        var writeWithErrors = !apolloUtilities.graphQLResultHasError(result);
+        if (ignoreErrors && apolloUtilities.graphQLResultHasError(result) && result.data) {
+            writeWithErrors = true;
+        }
+        if (!fetchMoreForQueryId && writeWithErrors) {
+            this.cache.write({
+                result: result.data,
+                dataId: 'ROOT_QUERY',
+                query: document,
+                variables: variables,
+            });
+        }
+    };
+    DataStore.prototype.markSubscriptionResult = function (result, document, variables) {
+        if (!apolloUtilities.graphQLResultHasError(result)) {
+            this.cache.write({
+                result: result.data,
+                dataId: 'ROOT_SUBSCRIPTION',
+                query: document,
+                variables: variables,
+            });
+        }
+    };
+    DataStore.prototype.markMutationInit = function (mutation) {
+        var _this = this;
+        if (mutation.optimisticResponse) {
+            var optimistic_1;
+            if (typeof mutation.optimisticResponse === 'function') {
+                optimistic_1 = mutation.optimisticResponse(mutation.variables);
+            }
+            else {
+                optimistic_1 = mutation.optimisticResponse;
+            }
+            var changeFn_1 = function () {
+                _this.markMutationResult({
+                    mutationId: mutation.mutationId,
+                    result: { data: optimistic_1 },
+                    document: mutation.document,
+                    variables: mutation.variables,
+                    updateQueries: mutation.updateQueries,
+                    update: mutation.update,
+                });
+            };
+            this.cache.recordOptimisticTransaction(function (c) {
+                var orig = _this.cache;
+                _this.cache = c;
+                try {
+                    changeFn_1();
+                }
+                finally {
+                    _this.cache = orig;
+                }
+            }, mutation.mutationId);
+        }
+    };
+    DataStore.prototype.markMutationResult = function (mutation) {
+        var _this = this;
+        if (!apolloUtilities.graphQLResultHasError(mutation.result)) {
+            var cacheWrites_1 = [];
+            cacheWrites_1.push({
+                result: mutation.result.data,
+                dataId: 'ROOT_MUTATION',
+                query: mutation.document,
+                variables: mutation.variables,
+            });
+            if (mutation.updateQueries) {
+                Object.keys(mutation.updateQueries)
+                    .filter(function (id) { return mutation.updateQueries[id]; })
+                    .forEach(function (queryId) {
+                    var _a = mutation.updateQueries[queryId], query = _a.query, updater = _a.updater;
+                    var _b = _this.cache.diff({
+                        query: query.document,
+                        variables: query.variables,
+                        returnPartialData: true,
+                        optimistic: false,
+                    }), currentQueryResult = _b.result, complete = _b.complete;
+                    if (!complete) {
+                        return;
+                    }
+                    var nextQueryResult = apolloUtilities.tryFunctionOrLogError(function () {
+                        return updater(currentQueryResult, {
+                            mutationResult: mutation.result,
+                            queryName: apolloUtilities.getOperationName(query.document) || undefined,
+                            queryVariables: query.variables,
+                        });
+                    });
+                    if (nextQueryResult) {
+                        cacheWrites_1.push({
+                            result: nextQueryResult,
+                            dataId: 'ROOT_QUERY',
+                            query: query.document,
+                            variables: query.variables,
+                        });
+                    }
+                });
+            }
+            this.cache.performTransaction(function (c) {
+                cacheWrites_1.forEach(function (write) { return c.write(write); });
+            });
+            var update_1 = mutation.update;
+            if (update_1) {
+                this.cache.performTransaction(function (c) {
+                    apolloUtilities.tryFunctionOrLogError(function () { return update_1(c, mutation.result); });
+                });
+            }
+        }
+    };
+    DataStore.prototype.markMutationComplete = function (_a) {
+        var mutationId = _a.mutationId, optimisticResponse = _a.optimisticResponse;
+        if (!optimisticResponse)
+            return;
+        this.cache.removeOptimistic(mutationId);
+    };
+    DataStore.prototype.markUpdateQueryResult = function (document, variables, newResult) {
+        this.cache.write({
+            result: newResult,
+            dataId: 'ROOT_QUERY',
+            variables: variables,
+            query: document,
+        });
+    };
+    DataStore.prototype.reset = function () {
+        return this.cache.reset();
+    };
+    return DataStore;
+}());
+
+var version = "2.1.0";
+
+var __assign$1 = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var hasSuggestedDevtools = false;
+var supportedDirectives = new apolloLink.ApolloLink(function (operation, forward) {
+    operation.query = apolloUtilities.removeConnectionDirectiveFromDocument(operation.query);
+    return forward(operation);
+});
+var ApolloClient$1 = (function () {
+    function ApolloClient(options) {
+        var _this = this;
+        this.defaultOptions = {};
+        var link = options.link, cache = options.cache, _a = options.ssrMode, ssrMode = _a === void 0 ? false : _a, _b = options.ssrForceFetchDelay, ssrForceFetchDelay = _b === void 0 ? 0 : _b, connectToDevTools = options.connectToDevTools, _c = options.queryDeduplication, queryDeduplication = _c === void 0 ? true : _c, defaultOptions = options.defaultOptions;
+        if (!link || !cache) {
+            throw new Error("\n        In order to initialize Apollo Client, you must specify link & cache properties on the config object.\n        This is part of the required upgrade when migrating from Apollo Client 1.0 to Apollo Client 2.0.\n        For more information, please visit:\n          https://www.apollographql.com/docs/react/basics/setup.html\n        to help you get started.\n      ");
+        }
+        this.link = supportedDirectives.concat(link);
+        this.cache = cache;
+        this.store = new DataStore(cache);
+        this.disableNetworkFetches = ssrMode || ssrForceFetchDelay > 0;
+        this.queryDeduplication = queryDeduplication;
+        this.ssrMode = ssrMode;
+        this.defaultOptions = defaultOptions || {};
+        if (ssrForceFetchDelay) {
+            setTimeout(function () { return (_this.disableNetworkFetches = false); }, ssrForceFetchDelay);
+        }
+        this.watchQuery = this.watchQuery.bind(this);
+        this.query = this.query.bind(this);
+        this.mutate = this.mutate.bind(this);
+        this.resetStore = this.resetStore.bind(this);
+        this.reFetchObservableQueries = this.reFetchObservableQueries.bind(this);
+        var defaultConnectToDevTools = !apolloUtilities.isProduction() &&
+            typeof window !== 'undefined' &&
+            !window.__APOLLO_CLIENT__;
+        if (typeof connectToDevTools === 'undefined'
+            ? defaultConnectToDevTools
+            : connectToDevTools && typeof window !== 'undefined') {
+            window.__APOLLO_CLIENT__ = this;
+        }
+        if (!hasSuggestedDevtools && !apolloUtilities.isProduction()) {
+            hasSuggestedDevtools = true;
+            if (typeof window !== 'undefined' &&
+                window.document &&
+                window.top === window.self) {
+                if (typeof window.__APOLLO_DEVTOOLS_GLOBAL_HOOK__ === 'undefined') {
+                    if (navigator.userAgent.indexOf('Chrome') > -1) {
+                        console.debug('Download the Apollo DevTools ' +
+                            'for a better development experience: ' +
+                            'https://chrome.google.com/webstore/detail/apollo-client-developer-t/jdkknkkbebbapilgoeccciglkfbmbnfm');
+                    }
+                }
+            }
+        }
+        this.version = version;
+    }
+    ApolloClient.prototype.watchQuery = function (options) {
+        this.initQueryManager();
+        if (this.defaultOptions.watchQuery) {
+            options = __assign$1({}, this.defaultOptions.watchQuery, options);
+        }
+        if (this.disableNetworkFetches && options.fetchPolicy === 'network-only') {
+            options = __assign$1({}, options, { fetchPolicy: 'cache-first' });
+        }
+        return this.queryManager.watchQuery(options);
+    };
+    ApolloClient.prototype.query = function (options) {
+        this.initQueryManager();
+        if (options.fetchPolicy === 'cache-and-network') {
+            throw new Error('cache-and-network fetchPolicy can only be used with watchQuery');
+        }
+        if (this.defaultOptions.query) {
+            options = __assign$1({}, this.defaultOptions.query, options);
+        }
+        if (this.disableNetworkFetches && options.fetchPolicy === 'network-only') {
+            options = __assign$1({}, options, { fetchPolicy: 'cache-first' });
+        }
+        return this.queryManager.query(options);
+    };
+    ApolloClient.prototype.mutate = function (options) {
+        this.initQueryManager();
+        if (this.defaultOptions.mutate) {
+            options = __assign$1({}, this.defaultOptions.mutate, options);
+        }
+        return this.queryManager.mutate(options);
+    };
+    ApolloClient.prototype.subscribe = function (options) {
+        this.initQueryManager();
+        return this.queryManager.startGraphQLSubscription(options);
+    };
+    ApolloClient.prototype.readQuery = function (options) {
+        return this.initProxy().readQuery(options);
+    };
+    ApolloClient.prototype.readFragment = function (options) {
+        return this.initProxy().readFragment(options);
+    };
+    ApolloClient.prototype.writeQuery = function (options) {
+        var result = this.initProxy().writeQuery(options);
+        this.queryManager.broadcastQueries();
+        return result;
+    };
+    ApolloClient.prototype.writeFragment = function (options) {
+        var result = this.initProxy().writeFragment(options);
+        this.queryManager.broadcastQueries();
+        return result;
+    };
+    ApolloClient.prototype.__actionHookForDevTools = function (cb) {
+        this.devToolsHookCb = cb;
+    };
+    ApolloClient.prototype.__requestRaw = function (payload) {
+        return apolloLink.execute(this.link, payload);
+    };
+    ApolloClient.prototype.initQueryManager = function () {
+        var _this = this;
+        if (this.queryManager)
+            return;
+        this.queryManager = new QueryManager({
+            link: this.link,
+            store: this.store,
+            queryDeduplication: this.queryDeduplication,
+            ssrMode: this.ssrMode,
+            onBroadcast: function () {
+                if (_this.devToolsHookCb) {
+                    _this.devToolsHookCb({
+                        action: {},
+                        state: {
+                            queries: _this.queryManager.queryStore.getStore(),
+                            mutations: _this.queryManager.mutationStore.getStore(),
+                        },
+                        dataWithOptimisticResults: _this.cache.extract(true),
+                    });
+                }
+            },
+        });
+    };
+    ApolloClient.prototype.resetStore = function () {
+        return this.queryManager
+            ? this.queryManager.resetStore()
+            : Promise.resolve(null);
+    };
+    ApolloClient.prototype.reFetchObservableQueries = function () {
+        return this.queryManager
+            ? this.queryManager.reFetchObservableQueries()
+            : Promise.resolve(null);
+    };
+    ApolloClient.prototype.extract = function (optimistic) {
+        return this.initProxy().extract(optimistic);
+    };
+    ApolloClient.prototype.restore = function (serializedState) {
+        return this.initProxy().restore(serializedState);
+    };
+    ApolloClient.prototype.initProxy = function () {
+        if (!this.proxy) {
+            this.initQueryManager();
+            this.proxy = this.cache;
+        }
+        return this.proxy;
+    };
+    return ApolloClient;
+}());
+
+exports.ApolloClient = ApolloClient$1;
+exports['default'] = ApolloClient$1;
+exports.printAST = printer.print;
+exports.ObservableQuery = ObservableQuery;
+exports.ApolloError = ApolloError;
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+})));
+
+
+},{"apollo-link":7,"apollo-link-dedup":5,"apollo-utilities":8,"graphql/language/printer":21,"symbol-observable":25}],5:[function(require,module,exports){
+(function (global, factory) {
+	typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('apollo-link')) :
+	typeof define === 'function' && define.amd ? define(['exports', 'apollo-link'], factory) :
+	(factory((global.apolloLink = global.apolloLink || {}, global.apolloLink.dedup = {}),global.apolloLink.core));
+}(this, (function (exports,apolloLink) { 'use strict';
+
+var __extends = (undefined && undefined.__extends) || (function () {
+    var extendStatics = Object.setPrototypeOf ||
+        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
+        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
+    return function (d, b) {
+        extendStatics(d, b);
+        function __() { this.constructor = d; }
+        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+    };
+})();
+var DedupLink = (function (_super) {
+    __extends(DedupLink, _super);
+    function DedupLink() {
+        var _this = _super !== null && _super.apply(this, arguments) || this;
+        _this.inFlightRequestObservables = new Map();
+        _this.subscribers = new Map();
+        return _this;
+    }
+    DedupLink.prototype.request = function (operation, forward) {
+        var _this = this;
+        if (operation.getContext().forceFetch) {
+            return forward(operation);
+        }
+        var key = operation.toKey();
+        var cleanup = function (key) {
+            _this.inFlightRequestObservables.delete(key);
+            var prev = _this.subscribers.get(key);
+            return prev;
+        };
+        if (!this.inFlightRequestObservables.get(key)) {
+            var singleObserver_1 = forward(operation);
+            var subscription_1;
+            var sharedObserver = new apolloLink.Observable(function (observer) {
+                var prev = _this.subscribers.get(key);
+                if (!prev)
+                    prev = { next: [], error: [], complete: [] };
+                _this.subscribers.set(key, {
+                    next: prev.next.concat([observer.next.bind(observer)]),
+                    error: prev.error.concat([observer.error.bind(observer)]),
+                    complete: prev.complete.concat([observer.complete.bind(observer)]),
+                });
+                if (!subscription_1) {
+                    subscription_1 = singleObserver_1.subscribe({
+                        next: function (result) {
+                            var prev = cleanup(key);
+                            _this.subscribers.delete(key);
+                            if (prev) {
+                                prev.next.forEach(function (next) { return next(result); });
+                                prev.complete.forEach(function (complete) { return complete(); });
+                            }
+                        },
+                        error: function (error) {
+                            var prev = cleanup(key);
+                            _this.subscribers.delete(key);
+                            if (prev)
+                                prev.error.forEach(function (err) { return err(error); });
+                        },
+                    });
+                }
+                return function () {
+                    if (subscription_1)
+                        subscription_1.unsubscribe();
+                    _this.inFlightRequestObservables.delete(key);
+                };
+            });
+            this.inFlightRequestObservables.set(key, sharedObserver);
+        }
+        return this.inFlightRequestObservables.get(key);
+    };
+    return DedupLink;
+}(apolloLink.ApolloLink));
+
+exports.DedupLink = DedupLink;
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+})));
+
+
+},{"apollo-link":7}],6:[function(require,module,exports){
+(function (global, factory) {
+	typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('apollo-link'), require('graphql/language/printer')) :
+	typeof define === 'function' && define.amd ? define(['exports', 'apollo-link', 'graphql/language/printer'], factory) :
+	(factory((global.apolloLink = global.apolloLink || {}, global.apolloLink.http = {}),global.apolloLink.core,global.printer));
+}(this, (function (exports,apolloLink,printer) { 'use strict';
+
+var __extends = (undefined && undefined.__extends) || (function () {
+    var extendStatics = Object.setPrototypeOf ||
+        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
+        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
+    return function (d, b) {
+        extendStatics(d, b);
+        function __() { this.constructor = d; }
+        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+    };
+})();
+var __assign = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+var __rest = (undefined && undefined.__rest) || function (s, e) {
+    var t = {};
+    for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p) && e.indexOf(p) < 0)
+        t[p] = s[p];
+    if (s != null && typeof Object.getOwnPropertySymbols === "function")
+        for (var i = 0, p = Object.getOwnPropertySymbols(s); i < p.length; i++) if (e.indexOf(p[i]) < 0)
+            t[p[i]] = s[p[i]];
+    return t;
+};
+var throwServerError = function (response, result, message) {
+    var error = new Error(message);
+    error.response = response;
+    error.statusCode = response.status;
+    error.result = result;
+    throw error;
+};
+var parseAndCheckResponse = function (request) { return function (response) {
+    return response
+        .text()
+        .then(function (bodyText) {
+        try {
+            return JSON.parse(bodyText);
+        }
+        catch (err) {
+            var parseError = err;
+            parseError.response = response;
+            parseError.statusCode = response.status;
+            parseError.bodyText = bodyText;
+            return Promise.reject(parseError);
+        }
+    })
+        .then(function (result) {
+        if (response.status >= 300) {
+            throwServerError(response, result, "Response not successful: Received status code " + response.status);
+        }
+        if (!result.hasOwnProperty('data') && !result.hasOwnProperty('errors')) {
+            throwServerError(response, result, "Server response was missing for query '" + request.operationName + "'.");
+        }
+        return result;
+    });
+}; };
+var checkFetcher = function (fetcher) {
+    if (fetcher.use) {
+        throw new Error("\n      It looks like you're using apollo-fetch! Apollo Link now uses native fetch\n      implementation, so apollo-fetch is not needed. If you want to use your existing\n      apollo-fetch middleware, please check this guide to upgrade:\n        https://github.com/apollographql/apollo-link/blob/master/docs/implementation.md\n    ");
+    }
+};
+var warnIfNoFetch = function (fetcher) {
+    if (!fetcher && typeof fetch === 'undefined') {
+        var library = 'unfetch';
+        if (typeof window === 'undefined')
+            library = 'node-fetch';
+        throw new Error("fetch is not found globally and no fetcher passed, to fix pass a fetch for\n      your environment like https://www.npmjs.com/package/" + library + ".\n\n      For example:\n        import fetch from '" + library + "';\n        import { createHttpLink } from 'apollo-link-http';\n\n        const link = createHttpLink({ uri: '/graphql', fetch: fetch });\n      ");
+    }
+};
+var createSignalIfSupported = function () {
+    if (typeof AbortController === 'undefined')
+        return { controller: false, signal: false };
+    var controller = new AbortController();
+    var signal = controller.signal;
+    return { controller: controller, signal: signal };
+};
+var defaultHttpOptions = {
+    includeQuery: true,
+    includeExtensions: false,
+};
+var createHttpLink = function (_a) {
+    if (_a === void 0) { _a = {}; }
+    var uri = _a.uri, fetcher = _a.fetch, includeExtensions = _a.includeExtensions, requestOptions = __rest(_a, ["uri", "fetch", "includeExtensions"]);
+    warnIfNoFetch(fetcher);
+    if (fetcher)
+        checkFetcher(fetcher);
+    if (!fetcher)
+        fetcher = fetch;
+    if (!uri)
+        uri = '/graphql';
+    return new apolloLink.ApolloLink(function (operation) {
+        return new apolloLink.Observable(function (observer) {
+            var _a = operation.getContext(), headers = _a.headers, credentials = _a.credentials, _b = _a.fetchOptions, fetchOptions = _b === void 0 ? {} : _b, contextURI = _a.uri, _c = _a.http, httpOptions = _c === void 0 ? {} : _c;
+            var operationName = operation.operationName, extensions = operation.extensions, variables = operation.variables, query = operation.query;
+            var http = __assign({}, defaultHttpOptions, httpOptions);
+            var body = { operationName: operationName, variables: variables };
+            if (includeExtensions || http.includeExtensions)
+                body.extensions = extensions;
+            if (http.includeQuery)
+                body.query = printer.print(query);
+            var serializedBody;
+            try {
+                serializedBody = JSON.stringify(body);
+            }
+            catch (e) {
+                var parseError = new Error("Network request failed. Payload is not serializable: " + e.message);
+                parseError.parseError = e;
+                throw parseError;
+            }
+            var options = fetchOptions;
+            if (requestOptions.fetchOptions)
+                options = __assign({}, requestOptions.fetchOptions, options);
+            var fetcherOptions = __assign({ method: 'POST' }, options, { headers: {
+                    accept: '*/*',
+                    'content-type': 'application/json',
+                }, body: serializedBody });
+            if (requestOptions.credentials)
+                fetcherOptions.credentials = requestOptions.credentials;
+            if (credentials)
+                fetcherOptions.credentials = credentials;
+            if (requestOptions.headers)
+                fetcherOptions.headers = __assign({}, fetcherOptions.headers, requestOptions.headers);
+            if (headers)
+                fetcherOptions.headers = __assign({}, fetcherOptions.headers, headers);
+            var _d = createSignalIfSupported(), controller = _d.controller, signal = _d.signal;
+            if (controller)
+                fetcherOptions.signal = signal;
+            fetcher(contextURI || uri, fetcherOptions)
+                .then(function (response) {
+                operation.setContext({ response: response });
+                return response;
+            })
+                .then(parseAndCheckResponse(operation))
+                .then(function (result) {
+                observer.next(result);
+                observer.complete();
+                return result;
+            })
+                .catch(function (err) {
+                if (err.name === 'AbortError')
+                    return;
+                observer.error(err);
+            });
+            return function () {
+                if (controller)
+                    controller.abort();
+            };
+        });
+    });
+};
+var HttpLink = (function (_super) {
+    __extends(HttpLink, _super);
+    function HttpLink(opts) {
+        return _super.call(this, createHttpLink(opts).request) || this;
+    }
+    return HttpLink;
+}(apolloLink.ApolloLink));
+
+exports.createHttpLink = createHttpLink;
+exports.HttpLink = HttpLink;
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+})));
+
+
+},{"apollo-link":7,"graphql/language/printer":21}],7:[function(require,module,exports){
+(function (global, factory) {
+	typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('zen-observable'), require('apollo-utilities'), require('graphql/language/printer')) :
+	typeof define === 'function' && define.amd ? define(['exports', 'zen-observable', 'apollo-utilities', 'graphql/language/printer'], factory) :
+	(factory((global.apolloLink = global.apolloLink || {}, global.apolloLink.core = {}),global.Observable,global.apollo.utilities,global.printer));
+}(this, (function (exports,Observable,apolloUtilities,printer) { 'use strict';
+
+var __extends = (undefined && undefined.__extends) || (function () {
+    var extendStatics = Object.setPrototypeOf ||
+        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
+        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
+    return function (d, b) {
+        extendStatics(d, b);
+        function __() { this.constructor = d; }
+        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
+    };
+})();
+var __assign = (undefined && undefined.__assign) || Object.assign || function(t) {
+    for (var s, i = 1, n = arguments.length; i < n; i++) {
+        s = arguments[i];
+        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
+            t[p] = s[p];
+    }
+    return t;
+};
+function validateOperation(operation) {
+    var OPERATION_FIELDS = [
+        'query',
+        'operationName',
+        'variables',
+        'extensions',
+        'context',
+    ];
+    for (var _i = 0, _a = Object.keys(operation); _i < _a.length; _i++) {
+        var key = _a[_i];
+        if (OPERATION_FIELDS.indexOf(key) < 0) {
+            throw new Error("illegal argument: " + key);
+        }
+    }
+    return operation;
+}
+var LinkError = (function (_super) {
+    __extends(LinkError, _super);
+    function LinkError(message, link) {
+        var _this = _super.call(this, message) || this;
+        _this.link = link;
+        return _this;
+    }
+    return LinkError;
+}(Error));
+function isTerminating(link) {
+    return link.request.length <= 1;
+}
+function toPromise(observable) {
+    var completed = false;
+    return new Promise(function (resolve, reject) {
+        observable.subscribe({
+            next: function (data) {
+                if (completed) {
+                    console.warn("Promise Wrapper does not support multiple results from Observable");
+                }
+                else {
+                    completed = true;
+                    resolve(data);
+                }
+            },
+            error: reject,
+        });
+    });
+}
+var makePromise = toPromise;
+function fromPromise(promise) {
+    return new Observable(function (observer) {
+        promise
+            .then(function (value) {
+            observer.next(value);
+            observer.complete();
+        })
+            .catch(observer.error.bind(observer));
+    });
+}
+function transformOperation(operation) {
+    var transformedOperation = {
+        variables: operation.variables || {},
+        extensions: operation.extensions || {},
+        operationName: operation.operationName,
+        query: operation.query,
+    };
+    if (!transformedOperation.operationName) {
+        transformedOperation.operationName =
+            typeof transformedOperation.query !== 'string'
+                ? apolloUtilities.getOperationName(transformedOperation.query)
+                : '';
+    }
+    return transformedOperation;
+}
+function createOperation(starting, operation) {
+    var context = __assign({}, starting);
+    var setContext = function (next) {
+        if (typeof next === 'function') {
+            context = __assign({}, context, next(context));
+        }
+        else {
+            context = __assign({}, context, next);
+        }
+    };
+    var getContext = function () { return (__assign({}, context)); };
+    Object.defineProperty(operation, 'setContext', {
+        enumerable: false,
+        value: setContext,
+    });
+    Object.defineProperty(operation, 'getContext', {
+        enumerable: false,
+        value: getContext,
+    });
+    Object.defineProperty(operation, 'toKey', {
+        enumerable: false,
+        value: function () { return getKey(operation); },
+    });
+    return operation;
+}
+function getKey(operation) {
+    return printer.print(operation.query) + "|" + JSON.stringify(operation.variables) + "|" + operation.operationName;
+}
+
+var passthrough = function (op, forward) { return (forward ? forward(op) : Observable.of()); };
+var toLink = function (handler) {
+    return typeof handler === 'function' ? new ApolloLink(handler) : handler;
+};
+var empty = function () {
+    return new ApolloLink(function (op, forward) { return Observable.of(); });
+};
+var from = function (links) {
+    if (links.length === 0)
+        return empty();
+    return links.map(toLink).reduce(function (x, y) { return x.concat(y); });
+};
+var split = function (test, left, right) {
+    if (right === void 0) { right = new ApolloLink(passthrough); }
+    var leftLink = toLink(left);
+    var rightLink = toLink(right);
+    if (isTerminating(leftLink) && isTerminating(rightLink)) {
+        return new ApolloLink(function (operation) {
+            return test(operation)
+                ? leftLink.request(operation) || Observable.of()
+                : rightLink.request(operation) || Observable.of();
+        });
+    }
+    else {
+        return new ApolloLink(function (operation, forward) {
+            return test(operation)
+                ? leftLink.request(operation, forward) || Observable.of()
+                : rightLink.request(operation, forward) || Observable.of();
+        });
+    }
+};
+var concat = function (first, second) {
+    var firstLink = toLink(first);
+    if (isTerminating(firstLink)) {
+        console.warn(new LinkError("You are calling concat on a terminating link, which will have no effect", firstLink));
+        return firstLink;
+    }
+    var nextLink = toLink(second);
+    if (isTerminating(nextLink)) {
+        return new ApolloLink(function (operation) {
+            return firstLink.request(operation, function (op) { return nextLink.request(op) || Observable.of(); }) || Observable.of();
+        });
+    }
+    else {
+        return new ApolloLink(function (operation, forward) {
+            return (firstLink.request(operation, function (op) {
+                return nextLink.request(op, forward) || Observable.of();
+            }) || Observable.of());
+        });
+    }
+};
+var ApolloLink = (function () {
+    function ApolloLink(request) {
+        if (request)
+            this.request = request;
+    }
+    ApolloLink.prototype.split = function (test, left, right) {
+        if (right === void 0) { right = new ApolloLink(passthrough); }
+        return this.concat(split(test, left, right));
+    };
+    ApolloLink.prototype.concat = function (next) {
+        return concat(this, next);
+    };
+    ApolloLink.prototype.request = function (operation, forward) {
+        throw new Error('request is not implemented');
+    };
+    ApolloLink.empty = empty;
+    ApolloLink.from = from;
+    ApolloLink.split = split;
+    return ApolloLink;
+}());
+function execute(link, operation) {
+    return (link.request(createOperation(operation.context, transformOperation(validateOperation(operation)))) || Observable.of());
+}
+
+exports.Observable = Observable;
+exports.makePromise = makePromise;
+exports.toPromise = toPromise;
+exports.fromPromise = fromPromise;
+exports.empty = empty;
+exports.from = from;
+exports.split = split;
+exports.concat = concat;
+exports.ApolloLink = ApolloLink;
+exports.execute = execute;
+
+Object.defineProperty(exports, '__esModule', { value: true });
+
+})));
+
+
+},{"apollo-utilities":8,"graphql/language/printer":21,"zen-observable":28}],8:[function(require,module,exports){
+(function (process){
+(function (global, factory) {
+	typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports) :
+	typeof define === 'function' && define.amd ? define(['exports'], factory) :
+	(factory((global.apollo = global.apollo || {}, global.apollo.utilities = {})));
+}(this, (function (exports) { 'use strict';
+
+function isScalarValue(value) {
+    return ['StringValue', 'BooleanValue', 'EnumValue'].indexOf(value.kind) > -1;
+}
+function isNumberValue(value) {
+    return ['IntValue', 'FloatValue'].indexOf(value.kind) > -1;
+}
 function isStringValue(value) {
     return value.kind === 'StringValue';
 }
@@ -68,8 +3220,7 @@ function valueToObjectRepresentation(argObj, name, value, variables) {
         argObj[name.value] = value.value;
     }
     else {
-        throw new Error("The inline argument \"" + name.value + "\" of kind \"" + value
-            .kind + "\" is not supported.\n                    Use variables instead of inline arguments to overcome this limitation.");
+        throw new Error("The inline argument \"" + name.value + "\" of kind \"" + value.kind + "\" is not supported.\n                    Use variables instead of inline arguments to overcome this limitation.");
     }
 }
 function storeKeyNameFromField(field, variables) {
@@ -123,6 +3274,17 @@ function getStoreKeyName(fieldName, args, directives) {
     }
     return fieldName;
 }
+function argumentsObjectFromField(field, variables) {
+    if (field.arguments && field.arguments.length) {
+        var argObj_1 = {};
+        field.arguments.forEach(function (_a) {
+            var name = _a.name, value = _a.value;
+            return valueToObjectRepresentation(argObj_1, name, value, variables);
+        });
+        return argObj_1;
+    }
+    return null;
+}
 function resultKeyNameFromField(field) {
     return field.alias ? field.alias.value : field.name.value;
 }
@@ -132,13 +3294,8 @@ function isField(selection) {
 function isInlineFragment(selection) {
     return selection.kind === 'InlineFragment';
 }
-function graphQLResultHasError(result) {
-    return result.errors && result.errors.length;
-}
 function isIdValue(idObject) {
-    return (idObject != null &&
-        typeof idObject === 'object' &&
-        idObject.type === 'id');
+    return idObject && idObject.type === 'id';
 }
 function toIdValue(id, generated) {
     if (generated === void 0) { generated = false; }
@@ -153,24 +3310,124 @@ function isJsonValue(jsonObject) {
         typeof jsonObject === 'object' &&
         jsonObject.type === 'json');
 }
-
-function assign(target) {
-    var sources = [];
-    for (var _i = 1; _i < arguments.length; _i++) {
-        sources[_i - 1] = arguments[_i];
-    }
-    sources.forEach(function (source) {
-        if (typeof source === 'undefined' || source === null) {
-            return;
+function defaultValueFromVariable(node) {
+    throw new Error("Variable nodes are not supported by valueFromNode");
+}
+function valueFromNode(node, onVariable) {
+    if (onVariable === void 0) { onVariable = defaultValueFromVariable; }
+    switch (node.kind) {
+        case 'Variable':
+            return onVariable(node);
+        case 'NullValue':
+            return null;
+        case 'IntValue':
+            return parseInt(node.value);
+        case 'FloatValue':
+            return parseFloat(node.value);
+        case 'ListValue':
+            return node.values.map(function (v) { return valueFromNode(v, onVariable); });
+        case 'ObjectValue': {
+            var value = {};
+            for (var _i = 0, _a = node.fields; _i < _a.length; _i++) {
+                var field = _a[_i];
+                value[field.name.value] = valueFromNode(field.value, onVariable);
+            }
+            return value;
         }
-        Object.keys(source).forEach(function (key) {
-            target[key] = source[key];
-        });
-    });
-    return target;
+        default:
+            return node.value;
+    }
 }
 
-var __assign$1 = (undefined && undefined.__assign) || Object.assign || function(t) {
+function getDirectiveInfoFromField(field, variables) {
+    if (field.directives && field.directives.length) {
+        var directiveObj_1 = {};
+        field.directives.forEach(function (directive) {
+            directiveObj_1[directive.name.value] = argumentsObjectFromField(directive, variables);
+        });
+        return directiveObj_1;
+    }
+    return null;
+}
+function shouldInclude(selection, variables) {
+    if (variables === void 0) { variables = {}; }
+    if (!selection.directives) {
+        return true;
+    }
+    var res = true;
+    selection.directives.forEach(function (directive) {
+        if (directive.name.value !== 'skip' && directive.name.value !== 'include') {
+            return;
+        }
+        var directiveArguments = directive.arguments || [];
+        var directiveName = directive.name.value;
+        if (directiveArguments.length !== 1) {
+            throw new Error("Incorrect number of arguments for the @" + directiveName + " directive.");
+        }
+        var ifArgument = directiveArguments[0];
+        if (!ifArgument.name || ifArgument.name.value !== 'if') {
+            throw new Error("Invalid argument for the @" + directiveName + " directive.");
+        }
+        var ifValue = directiveArguments[0].value;
+        var evaledValue = false;
+        if (!ifValue || ifValue.kind !== 'BooleanValue') {
+            if (ifValue.kind !== 'Variable') {
+                throw new Error("Argument for the @" + directiveName + " directive must be a variable or a bool ean value.");
+            }
+            else {
+                evaledValue = variables[ifValue.name.value];
+                if (evaledValue === undefined) {
+                    throw new Error("Invalid variable referenced in @" + directiveName + " directive.");
+                }
+            }
+        }
+        else {
+            evaledValue = ifValue.value;
+        }
+        if (directiveName === 'skip') {
+            evaledValue = !evaledValue;
+        }
+        if (!evaledValue) {
+            res = false;
+        }
+    });
+    return res;
+}
+function flattenSelections(selection) {
+    if (!selection.selectionSet ||
+        !(selection.selectionSet.selections.length > 0))
+        return [selection];
+    return [selection].concat(selection.selectionSet.selections
+        .map(function (selectionNode) {
+        return [selectionNode].concat(flattenSelections(selectionNode));
+    })
+        .reduce(function (selections, selected) { return selections.concat(selected); }, []));
+}
+var added = new Map();
+function getDirectiveNames(doc) {
+    var cached = added.get(doc);
+    if (cached)
+        return cached;
+    var directives = doc.definitions
+        .filter(function (definition) {
+        return definition.selectionSet && definition.selectionSet.selections;
+    })
+        .map(function (x) { return flattenSelections(x); })
+        .reduce(function (selections, selected) { return selections.concat(selected); }, [])
+        .filter(function (selection) {
+        return selection.directives && selection.directives.length > 0;
+    })
+        .map(function (selection) { return selection.directives; })
+        .reduce(function (directives, directive) { return directives.concat(directive); }, [])
+        .map(function (directive) { return directive.name.value; });
+    added.set(doc, directives);
+    return directives;
+}
+function hasDirectives(names, doc) {
+    return getDirectiveNames(doc).some(function (name) { return names.indexOf(name) > -1; });
+}
+
+var __assign = (undefined && undefined.__assign) || Object.assign || function(t) {
     for (var s, i = 1, n = arguments.length; i < n; i++) {
         s = arguments[i];
         for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
@@ -178,104 +3435,12 @@ var __assign$1 = (undefined && undefined.__assign) || Object.assign || function(
     }
     return t;
 };
-function getMutationDefinition(doc) {
-    checkDocument(doc);
-    var mutationDef = null;
-    doc.definitions.forEach(function (definition) {
-        if (definition.kind === 'OperationDefinition' &&
-            definition.operation === 'mutation') {
-            mutationDef = definition;
-        }
-    });
-    if (!mutationDef) {
-        throw new Error('Must contain a mutation definition.');
-    }
-    return mutationDef;
-}
-function checkDocument(doc) {
-    if (doc.kind !== 'Document') {
-        throw new Error("Expecting a parsed GraphQL document. Perhaps you need to wrap the query string in a \"gql\" tag? http://docs.apollostack.com/apollo-client/core.html#gql");
-    }
-    var foundOperation = false;
-    doc.definitions.forEach(function (definition) {
-        switch (definition.kind) {
-            case 'FragmentDefinition':
-                break;
-            case 'OperationDefinition':
-                if (foundOperation) {
-                    throw new Error('Queries must have exactly one operation definition.');
-                }
-                foundOperation = true;
-                break;
-            default:
-                throw new Error("Schema type definitions not allowed in queries. Found: \"" + definition.kind + "\"");
-        }
-    });
-}
-function getOperationName(doc) {
-    var res = null;
-    doc.definitions.forEach(function (definition) {
-        if (definition.kind === 'OperationDefinition' && definition.name) {
-            res = definition.name.value;
-        }
-    });
-    return res;
-}
-function getFragmentDefinitions(doc) {
-    var fragmentDefinitions = doc.definitions.filter(function (definition) {
-        if (definition.kind === 'FragmentDefinition') {
-            return true;
-        }
-        else {
-            return false;
-        }
-    });
-    return fragmentDefinitions;
-}
-function getQueryDefinition(doc) {
-    checkDocument(doc);
-    var queryDef = null;
-    doc.definitions.map(function (definition) {
-        if (definition.kind === 'OperationDefinition' &&
-            definition.operation === 'query') {
-            queryDef = definition;
-        }
-    });
-    if (!queryDef) {
-        throw new Error('Must contain a query definition.');
-    }
-    return queryDef;
-}
-function getOperationDefinition(doc) {
-    checkDocument(doc);
-    var opDef = null;
-    doc.definitions.map(function (definition) {
-        if (definition.kind === 'OperationDefinition') {
-            opDef = definition;
-        }
-    });
-    if (!opDef) {
-        throw new Error('Must contain a query definition.');
-    }
-    return opDef;
-}
-
-function createFragmentMap(fragments) {
-    if (fragments === void 0) { fragments = []; }
-    var symTable = {};
-    fragments.forEach(function (fragment) {
-        symTable[fragment.name.value] = fragment;
-    });
-    return symTable;
-}
 function getFragmentQueryDocument(document, fragmentName) {
     var actualFragmentName = fragmentName;
     var fragments = [];
     document.definitions.forEach(function (definition) {
         if (definition.kind === 'OperationDefinition') {
-            throw new Error("Found a " + definition.operation + " operation" + (definition.name
-                ? " named '" + definition.name.value + "'"
-                : '') + ". " +
+            throw new Error("Found a " + definition.operation + " operation" + (definition.name ? " named '" + definition.name.value + "'" : '') + ". " +
                 'No operations are allowed when using a fragment as a query. Only fragments are allowed.');
         }
         if (definition.kind === 'FragmentDefinition') {
@@ -288,7 +3453,7 @@ function getFragmentQueryDocument(document, fragmentName) {
         }
         actualFragmentName = fragments[0].name.value;
     }
-    var query = __assign$1({}, document, { definitions: [
+    var query = __assign({}, document, { definitions: [
             {
                 kind: 'OperationDefinition',
                 operation: 'query',
@@ -308,8 +3473,125 @@ function getFragmentQueryDocument(document, fragmentName) {
         ].concat(document.definitions) });
     return query;
 }
+
+function assign(target) {
+    var sources = [];
+    for (var _i = 1; _i < arguments.length; _i++) {
+        sources[_i - 1] = arguments[_i];
+    }
+    sources.forEach(function (source) {
+        if (typeof source === 'undefined' || source === null) {
+            return;
+        }
+        Object.keys(source).forEach(function (key) {
+            target[key] = source[key];
+        });
+    });
+    return target;
+}
+
+function getMutationDefinition(doc) {
+    checkDocument(doc);
+    var mutationDef = doc.definitions.filter(function (definition) {
+        return definition.kind === 'OperationDefinition' &&
+            definition.operation === 'mutation';
+    })[0];
+    if (!mutationDef) {
+        throw new Error('Must contain a mutation definition.');
+    }
+    return mutationDef;
+}
+function checkDocument(doc) {
+    if (doc.kind !== 'Document') {
+        throw new Error("Expecting a parsed GraphQL document. Perhaps you need to wrap the query string in a \"gql\" tag? http://docs.apollostack.com/apollo-client/core.html#gql");
+    }
+    var operations = doc.definitions
+        .filter(function (d) { return d.kind !== 'FragmentDefinition'; })
+        .map(function (definition) {
+        if (definition.kind !== 'OperationDefinition') {
+            throw new Error("Schema type definitions not allowed in queries. Found: \"" + definition.kind + "\"");
+        }
+        return definition;
+    });
+    if (operations.length > 1) {
+        throw new Error("Ambiguous GraphQL document: contains " + operations.length + " operations");
+    }
+}
+function getOperationDefinition(doc) {
+    checkDocument(doc);
+    return doc.definitions.filter(function (definition) { return definition.kind === 'OperationDefinition'; })[0];
+}
+function getOperationDefinitionOrDie(document) {
+    var def = getOperationDefinition(document);
+    if (!def) {
+        throw new Error("GraphQL document is missing an operation");
+    }
+    return def;
+}
+function getOperationName(doc) {
+    return (doc.definitions
+        .filter(function (definition) {
+        return definition.kind === 'OperationDefinition' && definition.name;
+    })
+        .map(function (x) { return x.name.value; })[0] || null);
+}
+function getFragmentDefinitions(doc) {
+    return doc.definitions.filter(function (definition) { return definition.kind === 'FragmentDefinition'; });
+}
+function getQueryDefinition(doc) {
+    var queryDef = getOperationDefinition(doc);
+    if (!queryDef || queryDef.operation !== 'query') {
+        throw new Error('Must contain a query definition.');
+    }
+    return queryDef;
+}
+function getFragmentDefinition(doc) {
+    if (doc.kind !== 'Document') {
+        throw new Error("Expecting a parsed GraphQL document. Perhaps you need to wrap the query string in a \"gql\" tag? http://docs.apollostack.com/apollo-client/core.html#gql");
+    }
+    if (doc.definitions.length > 1) {
+        throw new Error('Fragment must have exactly one definition.');
+    }
+    var fragmentDef = doc.definitions[0];
+    if (fragmentDef.kind !== 'FragmentDefinition') {
+        throw new Error('Must be a fragment definition.');
+    }
+    return fragmentDef;
+}
+function getMainDefinition(queryDoc) {
+    checkDocument(queryDoc);
+    var fragmentDefinition;
+    for (var _i = 0, _a = queryDoc.definitions; _i < _a.length; _i++) {
+        var definition = _a[_i];
+        if (definition.kind === 'OperationDefinition') {
+            var operation = definition.operation;
+            if (operation === 'query' ||
+                operation === 'mutation' ||
+                operation === 'subscription') {
+                return definition;
+            }
+        }
+        if (definition.kind === 'FragmentDefinition' && !fragmentDefinition) {
+            fragmentDefinition = definition;
+        }
+    }
+    if (fragmentDefinition) {
+        return fragmentDefinition;
+    }
+    throw new Error('Expected a parsed GraphQL query with a query, mutation, subscription, or a fragment.');
+}
+function createFragmentMap(fragments) {
+    if (fragments === void 0) { fragments = []; }
+    var symTable = {};
+    fragments.forEach(function (fragment) {
+        symTable[fragment.name.value] = fragment;
+    });
+    return symTable;
+}
 function getDefaultValues(definition) {
-    if (definition.variableDefinitions && definition.variableDefinitions.length) {
+    if (definition &&
+        definition.variableDefinitions &&
+        definition.variableDefinitions.length) {
         var defaultValues = definition.variableDefinitions
             .filter(function (_a) {
             var defaultValue = _a.defaultValue;
@@ -324,6 +3606,16 @@ function getDefaultValues(definition) {
         return assign.apply(void 0, [{}].concat(defaultValues));
     }
     return {};
+}
+function variablesInOperation(operation) {
+    var names = new Set();
+    if (operation.variableDefinitions) {
+        for (var _i = 0, _a = operation.variableDefinitions; _i < _a.length; _i++) {
+            var definition = _a[_i];
+            names.add(definition.variable.name.value);
+        }
+    }
+    return names;
 }
 
 function cloneDeep(value) {
@@ -376,560 +3668,92 @@ function addTypenameToSelectionSet(selectionSet, isRoot) {
         });
     }
 }
-function removeConnectionDirectiveFromSelectionSet(selectionSet) {
-    if (selectionSet.selections) {
-        selectionSet.selections.forEach(function (selection) {
-            if (selection.kind === 'Field' &&
-                selection &&
-                selection.directives) {
-                selection.directives = selection.directives.filter(function (directive) {
-                    var willRemove = directive.name.value === 'connection';
-                    if (willRemove) {
-                        if (!directive.arguments ||
-                            !directive.arguments.some(function (arg) { return arg.name.value === 'key'; })) {
-                            console.warn('Removing an @connection directive even though it does not have a key. ' +
-                                'You may want to use the key parameter to specify a store key.');
-                        }
-                    }
-                    return !willRemove;
-                });
-            }
+function removeDirectivesFromSelectionSet(directives, selectionSet) {
+    if (!selectionSet.selections)
+        return selectionSet;
+    var agressiveRemove = directives.some(function (dir) { return dir.remove; });
+    selectionSet.selections = selectionSet.selections
+        .map(function (selection) {
+        if (selection.kind !== 'Field' ||
+            !selection ||
+            !selection.directives)
+            return selection;
+        var remove;
+        selection.directives = selection.directives.filter(function (directive) {
+            var shouldKeep = !directives.some(function (dir) {
+                if (dir.name && dir.name === directive.name.value)
+                    return true;
+                if (dir.test && dir.test(directive))
+                    return true;
+                return false;
+            });
+            if (!remove && !shouldKeep && agressiveRemove)
+                remove = true;
+            return shouldKeep;
         });
-        selectionSet.selections.forEach(function (selection) {
-            if (selection.kind === 'Field') {
-                if (selection.selectionSet) {
-                    removeConnectionDirectiveFromSelectionSet(selection.selectionSet);
-                }
-            }
-            else if (selection.kind === 'InlineFragment') {
-                if (selection.selectionSet) {
-                    removeConnectionDirectiveFromSelectionSet(selection.selectionSet);
-                }
-            }
-        });
-    }
+        return remove ? null : selection;
+    })
+        .filter(function (x) { return !!x; });
+    selectionSet.selections.forEach(function (selection) {
+        if ((selection.kind === 'Field' || selection.kind === 'InlineFragment') &&
+            selection.selectionSet) {
+            removeDirectivesFromSelectionSet(directives, selection.selectionSet);
+        }
+    });
+    return selectionSet;
 }
+function removeDirectivesFromDocument(directives, doc) {
+    var docClone = cloneDeep(doc);
+    docClone.definitions.forEach(function (definition) {
+        removeDirectivesFromSelectionSet(directives, definition.selectionSet);
+    });
+    var operation = getOperationDefinitionOrDie(docClone);
+    var fragments = createFragmentMap(getFragmentDefinitions(docClone));
+    var isNotEmpty = function (op) {
+        return op.selectionSet.selections.filter(function (selectionSet) {
+            return !(selectionSet &&
+                selectionSet.kind === 'FragmentSpread' &&
+                !isNotEmpty(fragments[selectionSet.name.value]));
+        }).length > 0;
+    };
+    return isNotEmpty(operation) ? docClone : null;
+}
+var added$1 = new Map();
 function addTypenameToDocument(doc) {
     checkDocument(doc);
+    var cached = added$1.get(doc);
+    if (cached)
+        return cached;
     var docClone = cloneDeep(doc);
     docClone.definitions.forEach(function (definition) {
         var isRoot = definition.kind === 'OperationDefinition';
         addTypenameToSelectionSet(definition.selectionSet, isRoot);
     });
+    added$1.set(doc, docClone);
     return docClone;
 }
+var connectionRemoveConfig = {
+    test: function (directive) {
+        var willRemove = directive.name.value === 'connection';
+        if (willRemove) {
+            if (!directive.arguments ||
+                !directive.arguments.some(function (arg) { return arg.name.value === 'key'; })) {
+                console.warn('Removing an @connection directive even though it does not have a key. ' +
+                    'You may want to use the key parameter to specify a store key.');
+            }
+        }
+        return willRemove;
+    },
+};
+var removed = new Map();
 function removeConnectionDirectiveFromDocument(doc) {
     checkDocument(doc);
-    var docClone = cloneDeep(doc);
-    docClone.definitions.forEach(function (definition) {
-        removeConnectionDirectiveFromSelectionSet(definition.selectionSet);
-    });
+    var cached = removed.get(doc);
+    if (cached)
+        return cached;
+    var docClone = removeDirectivesFromDocument([connectionRemoveConfig], doc);
+    removed.set(doc, docClone);
     return docClone;
-}
-
-var __extends = (undefined && undefined.__extends) || (function () {
-    var extendStatics = Object.setPrototypeOf ||
-        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
-    return function (d, b) {
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-var __assign = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-function printRequest(request) {
-    return __assign({}, request, { query: printer.print(request.query) });
-}
-var BaseNetworkInterface = (function () {
-    function BaseNetworkInterface(uri, opts) {
-        if (opts === void 0) { opts = {}; }
-        if (!uri) {
-            throw new Error('A remote endpoint is required for a network layer');
-        }
-        if (typeof uri !== 'string') {
-            throw new Error('Remote endpoint must be a string');
-        }
-        this._uri = uri;
-        this._opts = __assign({}, opts);
-        this._middlewares = [];
-        this._afterwares = [];
-    }
-    BaseNetworkInterface.prototype.query = function (request) {
-        return new Promise(function (resolve, reject) {
-            reject(new Error('BaseNetworkInterface should not be used directly'));
-        });
-    };
-    return BaseNetworkInterface;
-}());
-var HTTPFetchNetworkInterface = (function (_super) {
-    __extends(HTTPFetchNetworkInterface, _super);
-    function HTTPFetchNetworkInterface() {
-        return _super !== null && _super.apply(this, arguments) || this;
-    }
-    HTTPFetchNetworkInterface.prototype.applyMiddlewares = function (requestAndOptions) {
-        var _this = this;
-        return new Promise(function (resolve, reject) {
-            var request = requestAndOptions.request, options = requestAndOptions.options;
-            var queue = function (funcs, scope) {
-                var next = function (err) {
-                    if (err) {
-                        reject(err);
-                    }
-                    else if (funcs.length > 0) {
-                        var f = funcs.shift();
-                        if (f) {
-                            f.applyMiddleware.apply(scope, [{ request: request, options: options }, next]);
-                        }
-                    }
-                    else {
-                        resolve({
-                            request: request,
-                            options: options,
-                        });
-                    }
-                };
-                next();
-            };
-            queue(_this._middlewares.slice(), _this);
-        });
-    };
-    HTTPFetchNetworkInterface.prototype.applyAfterwares = function (_a) {
-        var _this = this;
-        var response = _a.response, options = _a.options;
-        return new Promise(function (resolve, reject) {
-            var responseObject = { response: response, options: options };
-            var queue = function (funcs, scope) {
-                var next = function () {
-                    if (funcs.length > 0) {
-                        var f = funcs.shift();
-                        if (f) {
-                            f.applyAfterware.apply(scope, [responseObject, next]);
-                        }
-                    }
-                    else {
-                        resolve(responseObject);
-                    }
-                };
-                next();
-            };
-            queue(_this._afterwares.slice(), _this);
-        });
-    };
-    HTTPFetchNetworkInterface.prototype.fetchFromRemoteEndpoint = function (_a) {
-        var request = _a.request, options = _a.options;
-        return fetch(this._uri, __assign({}, this._opts, { body: JSON.stringify(printRequest(request)), method: 'POST' }, options, { headers: __assign({ Accept: '*/*', 'Content-Type': 'application/json' }, options.headers) }));
-    };
-    HTTPFetchNetworkInterface.prototype.query = function (request) {
-        var _this = this;
-        var options = __assign({}, this._opts);
-        return this.applyMiddlewares({
-            request: request,
-            options: options,
-        })
-            .then(function (rao) {
-            if (rao.request.query) {
-                rao.request.query = removeConnectionDirectiveFromDocument(rao.request.query);
-            }
-            return rao;
-        })
-            .then(function (rao) { return _this.fetchFromRemoteEndpoint.call(_this, rao); })
-            .then(function (response) {
-            return _this.applyAfterwares({
-                response: response,
-                options: options,
-            });
-        })
-            .then(function (_a) {
-            var response = _a.response;
-            var httpResponse = response;
-            return httpResponse.json().catch(function (error) {
-                var httpError = new Error("Network request failed with status " + response.status + " - \"" + response.statusText + "\"");
-                httpError.response = httpResponse;
-                httpError.parseError = error;
-                throw httpError;
-            });
-        })
-            .then(function (payload) {
-            if (!payload.hasOwnProperty('data') &&
-                !payload.hasOwnProperty('errors')) {
-                throw new Error("Server response was missing for query '" + request.debugName + "'.");
-            }
-            else {
-                return payload;
-            }
-        });
-    };
-    HTTPFetchNetworkInterface.prototype.use = function (middlewares) {
-        var _this = this;
-        middlewares.map(function (middleware) {
-            if (typeof middleware.applyMiddleware === 'function') {
-                _this._middlewares.push(middleware);
-            }
-            else {
-                throw new Error('Middleware must implement the applyMiddleware function');
-            }
-        });
-        return this;
-    };
-    HTTPFetchNetworkInterface.prototype.useAfter = function (afterwares) {
-        var _this = this;
-        afterwares.map(function (afterware) {
-            if (typeof afterware.applyAfterware === 'function') {
-                _this._afterwares.push(afterware);
-            }
-            else {
-                throw new Error('Afterware must implement the applyAfterware function');
-            }
-        });
-        return this;
-    };
-    return HTTPFetchNetworkInterface;
-}(BaseNetworkInterface));
-function createNetworkInterface(uriOrInterfaceOpts, secondArgOpts) {
-    if (secondArgOpts === void 0) { secondArgOpts = {}; }
-    if (!uriOrInterfaceOpts) {
-        throw new Error('You must pass an options argument to createNetworkInterface.');
-    }
-    var uri;
-    var opts;
-    if (typeof uriOrInterfaceOpts === 'string') {
-        console.warn("Passing the URI as the first argument to createNetworkInterface is deprecated as of Apollo Client 0.5. Please pass it as the \"uri\" property of the network interface options.");
-        opts = secondArgOpts.opts;
-        uri = uriOrInterfaceOpts;
-    }
-    else {
-        opts = uriOrInterfaceOpts.opts;
-        uri = uriOrInterfaceOpts.uri;
-    }
-    return new HTTPFetchNetworkInterface(uri, opts);
-}
-
-var QueryBatcher = (function () {
-    function QueryBatcher(_a) {
-        var batchInterval = _a.batchInterval, _b = _a.batchMax, batchMax = _b === void 0 ? 0 : _b, batchFetchFunction = _a.batchFetchFunction;
-        this.queuedRequests = [];
-        this.queuedRequests = [];
-        this.batchInterval = batchInterval;
-        this.batchMax = batchMax;
-        this.batchFetchFunction = batchFetchFunction;
-    }
-    QueryBatcher.prototype.enqueueRequest = function (request) {
-        var fetchRequest = {
-            request: request,
-        };
-        this.queuedRequests.push(fetchRequest);
-        fetchRequest.promise = new Promise(function (resolve, reject) {
-            fetchRequest.resolve = resolve;
-            fetchRequest.reject = reject;
-        });
-        if (this.queuedRequests.length === 1) {
-            this.scheduleQueueConsumption();
-        }
-        if (this.queuedRequests.length === this.batchMax) {
-            this.consumeQueue();
-        }
-        return fetchRequest.promise;
-    };
-    QueryBatcher.prototype.consumeQueue = function () {
-        var requests = this.queuedRequests.map(function (queuedRequest) { return queuedRequest.request; });
-        var promises = [];
-        var resolvers = [];
-        var rejecters = [];
-        this.queuedRequests.forEach(function (fetchRequest, index) {
-            promises.push(fetchRequest.promise);
-            resolvers.push(fetchRequest.resolve);
-            rejecters.push(fetchRequest.reject);
-        });
-        this.queuedRequests = [];
-        var batchedPromise = this.batchFetchFunction(requests);
-        batchedPromise
-            .then(function (results) {
-            results.forEach(function (result, index) {
-                resolvers[index](result);
-            });
-        })
-            .catch(function (error) {
-            rejecters.forEach(function (rejecter, index) {
-                rejecters[index](error);
-            });
-        });
-        return promises;
-    };
-    QueryBatcher.prototype.scheduleQueueConsumption = function () {
-        var _this = this;
-        setTimeout(function () {
-            if (_this.queuedRequests.length) {
-                _this.consumeQueue();
-            }
-        }, this.batchInterval);
-    };
-    return QueryBatcher;
-}());
-
-var __extends$1 = (undefined && undefined.__extends) || (function () {
-    var extendStatics = Object.setPrototypeOf ||
-        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
-    return function (d, b) {
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-var __assign$2 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var HTTPBatchedNetworkInterface = (function (_super) {
-    __extends$1(HTTPBatchedNetworkInterface, _super);
-    function HTTPBatchedNetworkInterface(_a) {
-        var uri = _a.uri, _b = _a.batchInterval, batchInterval = _b === void 0 ? 10 : _b, _c = _a.batchMax, batchMax = _c === void 0 ? 0 : _c, fetchOpts = _a.fetchOpts;
-        var _this = _super.call(this, uri, fetchOpts) || this;
-        if (typeof batchInterval !== 'number') {
-            throw new Error("batchInterval must be a number, got " + batchInterval);
-        }
-        if (typeof batchMax !== 'number') {
-            throw new Error("batchMax must be a number, got " + batchMax);
-        }
-        _this.batcher = new QueryBatcher({
-            batchInterval: batchInterval,
-            batchMax: batchMax,
-            batchFetchFunction: _this.batchQuery.bind(_this),
-        });
-        return _this;
-    }
-    HTTPBatchedNetworkInterface.prototype.query = function (request) {
-        return this.batcher.enqueueRequest(request);
-    };
-    HTTPBatchedNetworkInterface.prototype.batchQuery = function (requests) {
-        var _this = this;
-        var options = __assign$2({}, this._opts);
-        var middlewarePromise = this.applyBatchMiddlewares({
-            requests: requests,
-            options: options,
-        });
-        return new Promise(function (resolve, reject) {
-            middlewarePromise
-                .then(function (batchRequestAndOptions) {
-                batchRequestAndOptions.requests.forEach(function (r) {
-                    if (r.query)
-                        r.query = removeConnectionDirectiveFromDocument(r.query);
-                });
-                return _this.batchedFetchFromRemoteEndpoint(batchRequestAndOptions)
-                    .then(function (result) {
-                    var httpResponse = result;
-                    if (!httpResponse.ok) {
-                        return _this.applyBatchAfterwares({
-                            responses: [httpResponse],
-                            options: batchRequestAndOptions.options,
-                        }).then(function () {
-                            var httpError = new Error("Network request failed with status " + httpResponse.status + " - \"" + httpResponse.statusText + "\"");
-                            httpError.response = httpResponse;
-                            throw httpError;
-                        });
-                    }
-                    return result.json();
-                })
-                    .then(function (responses) {
-                    if (typeof responses.map !== 'function') {
-                        throw new Error('BatchingNetworkInterface: server response is not an array');
-                    }
-                    _this.applyBatchAfterwares({
-                        responses: responses,
-                        options: batchRequestAndOptions.options,
-                    })
-                        .then(function (responseAndOptions) {
-                        resolve(responseAndOptions.responses);
-                    })
-                        .catch(function (error) {
-                        reject(error);
-                    });
-                });
-            })
-                .catch(function (error) {
-                reject(error);
-            });
-        });
-    };
-    HTTPBatchedNetworkInterface.prototype.applyBatchMiddlewares = function (_a) {
-        var _this = this;
-        var requests = _a.requests, options = _a.options;
-        return new Promise(function (resolve, reject) {
-            var queue = function (funcs, scope) {
-                var next = function () {
-                    if (funcs.length > 0) {
-                        var f = funcs.shift();
-                        if (f) {
-                            f.applyBatchMiddleware.apply(scope, [
-                                { requests: requests, options: options },
-                                next,
-                            ]);
-                        }
-                    }
-                    else {
-                        resolve({
-                            requests: requests,
-                            options: options,
-                        });
-                    }
-                };
-                next();
-            };
-            queue(_this._middlewares.slice(), _this);
-        });
-    };
-    HTTPBatchedNetworkInterface.prototype.applyBatchAfterwares = function (_a) {
-        var _this = this;
-        var responses = _a.responses, options = _a.options;
-        return new Promise(function (resolve, reject) {
-            var responseObject = { responses: responses, options: options };
-            var queue = function (funcs, scope) {
-                var next = function () {
-                    if (funcs.length > 0) {
-                        var f = funcs.shift();
-                        if (f) {
-                            f.applyBatchAfterware.apply(scope, [responseObject, next]);
-                        }
-                    }
-                    else {
-                        resolve(responseObject);
-                    }
-                };
-                next();
-            };
-            queue(_this._afterwares.slice(), _this);
-        });
-    };
-    HTTPBatchedNetworkInterface.prototype.use = function (middlewares) {
-        var _this = this;
-        middlewares.map(function (middleware) {
-            if (typeof middleware.applyBatchMiddleware === 'function') {
-                _this._middlewares.push(middleware);
-            }
-            else {
-                throw new Error('Batch middleware must implement the applyBatchMiddleware function');
-            }
-        });
-        return this;
-    };
-    HTTPBatchedNetworkInterface.prototype.useAfter = function (afterwares) {
-        var _this = this;
-        afterwares.map(function (afterware) {
-            if (typeof afterware.applyBatchAfterware === 'function') {
-                _this._afterwares.push(afterware);
-            }
-            else {
-                throw new Error('Batch afterware must implement the applyBatchAfterware function');
-            }
-        });
-        return this;
-    };
-    HTTPBatchedNetworkInterface.prototype.batchedFetchFromRemoteEndpoint = function (batchRequestAndOptions) {
-        var options = {};
-        assign(options, batchRequestAndOptions.options);
-        var printedRequests = batchRequestAndOptions.requests.map(function (request) {
-            return printRequest(request);
-        });
-        return fetch(this._uri, __assign$2({}, this._opts, { body: JSON.stringify(printedRequests), method: 'POST' }, options, { headers: __assign$2({ Accept: '*/*', 'Content-Type': 'application/json' }, options.headers) }));
-    };
-    return HTTPBatchedNetworkInterface;
-}(BaseNetworkInterface));
-function createBatchingNetworkInterface(options) {
-    if (!options) {
-        throw new Error('You must pass an options argument to createNetworkInterface.');
-    }
-    return new HTTPBatchedNetworkInterface({
-        uri: options.uri,
-        batchInterval: options.batchInterval,
-        batchMax: options.batchMax,
-        fetchOpts: options.opts || {},
-    });
-}
-
-function isQueryResultAction(action) {
-    return action.type === 'APOLLO_QUERY_RESULT';
-}
-
-
-
-
-function isMutationInitAction(action) {
-    return action.type === 'APOLLO_MUTATION_INIT';
-}
-function isMutationResultAction(action) {
-    return action.type === 'APOLLO_MUTATION_RESULT';
-}
-function isMutationErrorAction(action) {
-    return action.type === 'APOLLO_MUTATION_ERROR';
-}
-function isUpdateQueryResultAction(action) {
-    return action.type === 'APOLLO_UPDATE_QUERY_RESULT';
-}
-function isStoreResetAction(action) {
-    return action.type === 'APOLLO_STORE_RESET';
-}
-function isSubscriptionResultAction(action) {
-    return action.type === 'APOLLO_SUBSCRIPTION_RESULT';
-}
-function isWriteAction(action) {
-    return action.type === 'APOLLO_WRITE';
-}
-
-function shouldInclude(selection, variables) {
-    if (variables === void 0) { variables = {}; }
-    if (!selection.directives) {
-        return true;
-    }
-    var res = true;
-    selection.directives.forEach(function (directive) {
-        if (directive.name.value !== 'skip' && directive.name.value !== 'include') {
-            return;
-        }
-        var directiveArguments = directive.arguments || [];
-        var directiveName = directive.name.value;
-        if (directiveArguments.length !== 1) {
-            throw new Error("Incorrect number of arguments for the @" + directiveName + " directive.");
-        }
-        var ifArgument = directiveArguments[0];
-        if (!ifArgument.name || ifArgument.name.value !== 'if') {
-            throw new Error("Invalid argument for the @" + directiveName + " directive.");
-        }
-        var ifValue = directiveArguments[0].value;
-        var evaledValue = false;
-        if (!ifValue || ifValue.kind !== 'BooleanValue') {
-            if (ifValue.kind !== 'Variable') {
-                throw new Error("Argument for the @" + directiveName + " directive must be a variable or a bool ean value.");
-            }
-            else {
-                evaledValue = variables[ifValue.name.value];
-                if (evaledValue === undefined) {
-                    throw new Error("Invalid variable referenced in @" + directiveName + " directive.");
-                }
-            }
-        }
-        else {
-            evaledValue = ifValue.value;
-        }
-        if (directiveName === 'skip') {
-            evaledValue = !evaledValue;
-        }
-        if (!evaledValue) {
-            res = false;
-        }
-    });
-    return res;
 }
 
 function getEnv() {
@@ -951,365 +3775,18 @@ function isTest() {
     return isEnv('test') === true;
 }
 
-var __extends$2 = (undefined && undefined.__extends) || (function () {
-    var extendStatics = Object.setPrototypeOf ||
-        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
-    return function (d, b) {
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-var __assign$5 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var WriteError = (function (_super) {
-    __extends$2(WriteError, _super);
-    function WriteError() {
-        var _this = _super !== null && _super.apply(this, arguments) || this;
-        _this.type = 'WriteError';
-        return _this;
-    }
-    return WriteError;
-}(Error));
-function enhanceErrorWithDocument(error, document) {
-    var enhancedError = new WriteError("Error writing result to store for query " + (document.loc &&
-        document.loc.source &&
-        document.loc.source.body));
-    enhancedError.message += '/n' + error.message;
-    enhancedError.stack = error.stack;
-    return enhancedError;
-}
-function writeQueryToStore(_a) {
-    var result = _a.result, query = _a.query, _b = _a.store, store = _b === void 0 ? {} : _b, variables = _a.variables, dataIdFromObject = _a.dataIdFromObject, _c = _a.fragmentMap, fragmentMap = _c === void 0 ? {} : _c, fragmentMatcherFunction = _a.fragmentMatcherFunction;
-    var queryDefinition = getQueryDefinition(query);
-    variables = assign({}, getDefaultValues(queryDefinition), variables);
+function tryFunctionOrLogError(f) {
     try {
-        return writeSelectionSetToStore({
-            dataId: 'ROOT_QUERY',
-            result: result,
-            selectionSet: queryDefinition.selectionSet,
-            context: {
-                store: store,
-                processedData: {},
-                variables: variables,
-                dataIdFromObject: dataIdFromObject,
-                fragmentMap: fragmentMap,
-                fragmentMatcherFunction: fragmentMatcherFunction,
-            },
-        });
+        return f();
     }
     catch (e) {
-        throw enhanceErrorWithDocument(e, query);
+        if (console.error) {
+            console.error(e);
+        }
     }
 }
-function writeResultToStore(_a) {
-    var dataId = _a.dataId, result = _a.result, document = _a.document, _b = _a.store, store = _b === void 0 ? {} : _b, variables = _a.variables, dataIdFromObject = _a.dataIdFromObject, fragmentMatcherFunction = _a.fragmentMatcherFunction;
-    var operationDefinition = getOperationDefinition(document);
-    var selectionSet = operationDefinition.selectionSet;
-    var fragmentMap = createFragmentMap(getFragmentDefinitions(document));
-    variables = assign({}, getDefaultValues(operationDefinition), variables);
-    try {
-        return writeSelectionSetToStore({
-            result: result,
-            dataId: dataId,
-            selectionSet: selectionSet,
-            context: {
-                store: store,
-                processedData: {},
-                variables: variables,
-                dataIdFromObject: dataIdFromObject,
-                fragmentMap: fragmentMap,
-                fragmentMatcherFunction: fragmentMatcherFunction,
-            },
-        });
-    }
-    catch (e) {
-        throw enhanceErrorWithDocument(e, document);
-    }
-}
-function writeSelectionSetToStore(_a) {
-    var result = _a.result, dataId = _a.dataId, selectionSet = _a.selectionSet, context = _a.context;
-    var variables = context.variables, store = context.store, dataIdFromObject = context.dataIdFromObject, fragmentMap = context.fragmentMap;
-    selectionSet.selections.forEach(function (selection) {
-        var included = shouldInclude(selection, variables);
-        if (isField(selection)) {
-            var resultFieldKey = resultKeyNameFromField(selection);
-            var value = result[resultFieldKey];
-            if (included) {
-                if (typeof value !== 'undefined') {
-                    writeFieldToStore({
-                        dataId: dataId,
-                        value: value,
-                        field: selection,
-                        context: context,
-                    });
-                }
-                else {
-                    if (context.fragmentMatcherFunction) {
-                        if (!isProduction()) {
-                            console.warn("Missing field " + resultFieldKey + " in " + JSON.stringify(result, null, 2).substring(0, 100));
-                        }
-                    }
-                }
-            }
-        }
-        else {
-            var fragment = void 0;
-            if (isInlineFragment(selection)) {
-                fragment = selection;
-            }
-            else {
-                fragment = (fragmentMap || {})[selection.name.value];
-                if (!fragment) {
-                    throw new Error("No fragment named " + selection.name.value + ".");
-                }
-            }
-            var matches = true;
-            if (context.fragmentMatcherFunction && fragment.typeCondition) {
-                var idValue = { type: 'id', id: 'self', generated: false };
-                var fakeContext = {
-                    store: { self: result },
-                    returnPartialData: false,
-                    hasMissingField: false,
-                    customResolvers: {},
-                };
-                matches = context.fragmentMatcherFunction(idValue, fragment.typeCondition.name.value, fakeContext);
-                if (fakeContext.returnPartialData) {
-                    console.error('WARNING: heuristic fragment matching going on!');
-                }
-            }
-            if (included && matches) {
-                writeSelectionSetToStore({
-                    result: result,
-                    selectionSet: fragment.selectionSet,
-                    dataId: dataId,
-                    context: context,
-                });
-            }
-        }
-    });
-    return store;
-}
-function isGeneratedId(id) {
-    return id[0] === '$';
-}
-function mergeWithGenerated(generatedKey, realKey, cache) {
-    var generated = cache[generatedKey];
-    var real = cache[realKey];
-    Object.keys(generated).forEach(function (key) {
-        var value = generated[key];
-        var realValue = real[key];
-        if (isIdValue(value) && isGeneratedId(value.id) && isIdValue(realValue)) {
-            mergeWithGenerated(value.id, realValue.id, cache);
-        }
-        delete cache[generatedKey];
-        cache[realKey] = __assign$5({}, generated, real);
-    });
-}
-function isDataProcessed(dataId, field, processedData) {
-    if (!processedData) {
-        return false;
-    }
-    if (processedData[dataId]) {
-        if (processedData[dataId].indexOf(field) >= 0) {
-            return true;
-        }
-        else {
-            processedData[dataId].push(field);
-        }
-    }
-    else {
-        processedData[dataId] = [field];
-    }
-    return false;
-}
-function writeFieldToStore(_a) {
-    var field = _a.field, value = _a.value, dataId = _a.dataId, context = _a.context;
-    var variables = context.variables, dataIdFromObject = context.dataIdFromObject, store = context.store;
-    var storeValue;
-    var storeFieldName = storeKeyNameFromField(field, variables);
-    var shouldMerge = false;
-    var generatedKey = '';
-    if (!field.selectionSet || value === null) {
-        storeValue =
-            value != null && typeof value === 'object'
-                ?
-                    { type: 'json', json: value }
-                :
-                    value;
-    }
-    else if (Array.isArray(value)) {
-        var generatedId = dataId + "." + storeFieldName;
-        storeValue = processArrayValue(value, generatedId, field.selectionSet, context);
-    }
-    else {
-        var valueDataId = dataId + "." + storeFieldName;
-        var generated = true;
-        if (!isGeneratedId(valueDataId)) {
-            valueDataId = '$' + valueDataId;
-        }
-        if (dataIdFromObject) {
-            var semanticId = dataIdFromObject(value);
-            if (semanticId && isGeneratedId(semanticId)) {
-                throw new Error('IDs returned by dataIdFromObject cannot begin with the "$" character.');
-            }
-            if (semanticId) {
-                valueDataId = semanticId;
-                generated = false;
-            }
-        }
-        if (!isDataProcessed(valueDataId, field, context.processedData)) {
-            writeSelectionSetToStore({
-                dataId: valueDataId,
-                result: value,
-                selectionSet: field.selectionSet,
-                context: context,
-            });
-        }
-        storeValue = {
-            type: 'id',
-            id: valueDataId,
-            generated: generated,
-        };
-        if (store[dataId] && store[dataId][storeFieldName] !== storeValue) {
-            var escapedId = store[dataId][storeFieldName];
-            if (isIdValue(storeValue) &&
-                storeValue.generated &&
-                isIdValue(escapedId) &&
-                !escapedId.generated) {
-                throw new Error("Store error: the application attempted to write an object with no provided id" +
-                    (" but the store already contains an id of " + escapedId.id + " for this object."));
-            }
-            if (isIdValue(escapedId) && escapedId.generated) {
-                generatedKey = escapedId.id;
-                shouldMerge = true;
-            }
-        }
-    }
-    var newStoreObj = __assign$5({}, store[dataId], (_b = {}, _b[storeFieldName] = storeValue, _b));
-    if (shouldMerge) {
-        mergeWithGenerated(generatedKey, storeValue.id, store);
-    }
-    if (!store[dataId] || storeValue !== store[dataId][storeFieldName]) {
-        store[dataId] = newStoreObj;
-    }
-    var _b;
-}
-function processArrayValue(value, generatedId, selectionSet, context) {
-    return value.map(function (item, index) {
-        if (item === null) {
-            return null;
-        }
-        var itemDataId = generatedId + "." + index;
-        if (Array.isArray(item)) {
-            return processArrayValue(item, itemDataId, selectionSet, context);
-        }
-        var generated = true;
-        if (context.dataIdFromObject) {
-            var semanticId = context.dataIdFromObject(item);
-            if (semanticId) {
-                itemDataId = semanticId;
-                generated = false;
-            }
-        }
-        if (!isDataProcessed(itemDataId, selectionSet, context.processedData)) {
-            writeSelectionSetToStore({
-                dataId: itemDataId,
-                result: item,
-                selectionSet: selectionSet,
-                context: context,
-            });
-        }
-        var idStoreValue = {
-            type: 'id',
-            id: itemDataId,
-            generated: generated,
-        };
-        return idStoreValue;
-    });
-}
-
-var __assign$7 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var optimisticDefaultState = [];
-function getDataWithOptimisticResults(store) {
-    if (store.optimistic.length === 0) {
-        return store.data;
-    }
-    var patches = store.optimistic.map(function (opt) { return opt.data; });
-    return assign.apply(void 0, [{}, store.data].concat(patches));
-}
-function optimistic(previousState, action, store, config) {
-    if (previousState === void 0) { previousState = optimisticDefaultState; }
-    if (isMutationInitAction(action) && action.optimisticResponse) {
-        var optimisticResponse = void 0;
-        if (typeof action.optimisticResponse === 'function') {
-            optimisticResponse = action.optimisticResponse(action.variables);
-        }
-        else {
-            optimisticResponse = action.optimisticResponse;
-        }
-        var fakeMutationResultAction = {
-            type: 'APOLLO_MUTATION_RESULT',
-            result: { data: optimisticResponse },
-            document: action.mutation,
-            operationName: action.operationName,
-            variables: action.variables,
-            mutationId: action.mutationId,
-            extraReducers: action.extraReducers,
-            updateQueries: action.updateQueries,
-            update: action.update,
-        };
-        var optimisticData = getDataWithOptimisticResults(__assign$7({}, store, { optimistic: previousState }));
-        var patch = getOptimisticDataPatch(optimisticData, fakeMutationResultAction, store.queries, store.mutations, config);
-        var optimisticState = {
-            action: fakeMutationResultAction,
-            data: patch,
-            mutationId: action.mutationId,
-        };
-        var newState = previousState.concat([optimisticState]);
-        return newState;
-    }
-    else if ((isMutationErrorAction(action) || isMutationResultAction(action)) &&
-        previousState.some(function (change) { return change.mutationId === action.mutationId; })) {
-        return rollbackOptimisticData(function (change) { return change.mutationId === action.mutationId; }, previousState, store, config);
-    }
-    return previousState;
-}
-function getOptimisticDataPatch(previousData, optimisticAction, queries, mutations, config) {
-    var optimisticData = data(previousData, optimisticAction, config);
-    var patch = {};
-    Object.keys(optimisticData).forEach(function (key) {
-        if (optimisticData[key] !== previousData[key]) {
-            patch[key] = optimisticData[key];
-        }
-    });
-    return patch;
-}
-function rollbackOptimisticData(filterFn, previousState, store, config) {
-    if (previousState === void 0) { previousState = optimisticDefaultState; }
-    var optimisticData = assign({}, store.data);
-    var newState = previousState
-        .filter(function (item) { return !filterFn(item); })
-        .map(function (change) {
-        var patch = getOptimisticDataPatch(optimisticData, change.action, store.queries, store.mutations, config);
-        assign(optimisticData, patch);
-        return __assign$7({}, change, { data: patch });
-    });
-    return newState;
+function graphQLResultHasError(result) {
+    return result.errors && result.errors.length;
 }
 
 function isEqual(a, b) {
@@ -1343,671 +3820,6 @@ function isEqual(a, b) {
     return false;
 }
 
-var __assign$8 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var ID_KEY = typeof Symbol !== 'undefined' ? Symbol('id') : '@@id';
-function readQueryFromStore(options) {
-    var optsPatch = { returnPartialData: false };
-    return diffQueryAgainstStore(__assign$8({}, options, optsPatch)).result;
-}
-var readStoreResolver = function (fieldName, idValue, args, context, _a) {
-    var resultKey = _a.resultKey, directives = _a.directives;
-    assertIdValue(idValue);
-    var objId = idValue.id;
-    var obj = context.store[objId];
-    var storeKeyName = getStoreKeyName(fieldName, args, directives);
-    var fieldValue = (obj || {})[storeKeyName];
-    if (typeof fieldValue === 'undefined') {
-        if (context.customResolvers &&
-            obj &&
-            (obj.__typename || objId === 'ROOT_QUERY')) {
-            var typename = obj.__typename || 'Query';
-            var type = context.customResolvers[typename];
-            if (type) {
-                var resolver = type[fieldName];
-                if (resolver) {
-                    fieldValue = resolver(obj, args);
-                }
-            }
-        }
-        if (typeof fieldValue === 'undefined') {
-            if (!context.returnPartialData) {
-                throw new Error("Can't find field " + storeKeyName + " on object (" + objId + ") " + JSON.stringify(obj, null, 2) + ".");
-            }
-            context.hasMissingField = true;
-            return fieldValue;
-        }
-    }
-    if (isJsonValue(fieldValue)) {
-        if (idValue.previousResult &&
-            isEqual(idValue.previousResult[resultKey], fieldValue.json)) {
-            return idValue.previousResult[resultKey];
-        }
-        return fieldValue.json;
-    }
-    if (idValue.previousResult) {
-        fieldValue = addPreviousResultToIdValues(fieldValue, idValue.previousResult[resultKey]);
-    }
-    return fieldValue;
-};
-function diffQueryAgainstStore(_a) {
-    var store = _a.store, query = _a.query, variables = _a.variables, previousResult = _a.previousResult, _b = _a.returnPartialData, returnPartialData = _b === void 0 ? true : _b, _c = _a.rootId, rootId = _c === void 0 ? 'ROOT_QUERY' : _c, fragmentMatcherFunction = _a.fragmentMatcherFunction, config = _a.config;
-    var queryDefinition = getQueryDefinition(query);
-    variables = assign({}, getDefaultValues(queryDefinition), variables);
-    var context = {
-        store: store,
-        returnPartialData: returnPartialData,
-        customResolvers: (config && config.customResolvers) || {},
-        hasMissingField: false,
-    };
-    var rootIdValue = {
-        type: 'id',
-        id: rootId,
-        previousResult: previousResult,
-    };
-    var result = graphqlAnywhere(readStoreResolver, query, rootIdValue, context, variables, {
-        fragmentMatcher: fragmentMatcherFunction,
-        resultMapper: resultMapper,
-    });
-    return {
-        result: result,
-        isMissing: context.hasMissingField,
-    };
-}
-function assertIdValue(idValue) {
-    if (!isIdValue(idValue)) {
-        throw new Error("Encountered a sub-selection on the query, but the store doesn't have an object reference. This should never happen during normal use unless you have custom code that is directly manipulating the store; please file an issue.");
-    }
-}
-function addPreviousResultToIdValues(value, previousResult) {
-    if (isIdValue(value)) {
-        return __assign$8({}, value, { previousResult: previousResult });
-    }
-    else if (Array.isArray(value)) {
-        var idToPreviousResult_1 = {};
-        if (Array.isArray(previousResult)) {
-            previousResult.forEach(function (item) {
-                if (item && item[ID_KEY]) {
-                    idToPreviousResult_1[item[ID_KEY]] = item;
-                }
-            });
-        }
-        return value.map(function (item, i) {
-            var itemPreviousResult = previousResult && previousResult[i];
-            if (isIdValue(item)) {
-                itemPreviousResult = idToPreviousResult_1[item.id] || itemPreviousResult;
-            }
-            return addPreviousResultToIdValues(item, itemPreviousResult);
-        });
-    }
-    return value;
-}
-function resultMapper(resultFields, idValue) {
-    if (idValue.previousResult) {
-        var currentResultKeys_1 = Object.keys(resultFields);
-        var sameAsPreviousResult = Object.keys(idValue.previousResult).reduce(function (sameKeys, key) { return sameKeys && currentResultKeys_1.indexOf(key) > -1; }, true) &&
-            currentResultKeys_1.reduce(function (same, key) {
-                return same &&
-                    areNestedArrayItemsStrictlyEqual(resultFields[key], idValue.previousResult[key]);
-            }, true);
-        if (sameAsPreviousResult) {
-            return idValue.previousResult;
-        }
-    }
-    Object.defineProperty(resultFields, ID_KEY, {
-        enumerable: false,
-        configurable: false,
-        writable: false,
-        value: idValue.id,
-    });
-    return resultFields;
-}
-function areNestedArrayItemsStrictlyEqual(a, b) {
-    if (a === b) {
-        return true;
-    }
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
-        return false;
-    }
-    return a.reduce(function (same, item, i) { return same && areNestedArrayItemsStrictlyEqual(item, b[i]); }, true);
-}
-
-var __assign$6 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var ReduxDataProxy = (function () {
-    function ReduxDataProxy(store, reduxRootSelector, fragmentMatcher, reducerConfig) {
-        this.store = store;
-        this.reduxRootSelector = reduxRootSelector;
-        this.reducerConfig = reducerConfig;
-        this.fragmentMatcher = fragmentMatcher;
-    }
-    ReduxDataProxy.prototype.readQuery = function (_a) {
-        var query = _a.query, variables = _a.variables;
-        if (this.reducerConfig.addTypename) {
-            query = addTypenameToDocument(query);
-        }
-        return readQueryFromStore({
-            rootId: 'ROOT_QUERY',
-            store: getDataWithOptimisticResults(this.reduxRootSelector(this.store.getState())),
-            query: query,
-            variables: variables,
-            fragmentMatcherFunction: this.fragmentMatcher.match,
-            config: this.reducerConfig,
-        });
-    };
-    ReduxDataProxy.prototype.readFragment = function (_a) {
-        var id = _a.id, fragment = _a.fragment, fragmentName = _a.fragmentName, variables = _a.variables;
-        var query = getFragmentQueryDocument(fragment, fragmentName);
-        var data = getDataWithOptimisticResults(this.reduxRootSelector(this.store.getState()));
-        if (typeof data[id] === 'undefined') {
-            return null;
-        }
-        if (this.reducerConfig.addTypename) {
-            query = addTypenameToDocument(query);
-        }
-        return readQueryFromStore({
-            rootId: id,
-            store: data,
-            query: query,
-            variables: variables,
-            fragmentMatcherFunction: this.fragmentMatcher.match,
-            config: this.reducerConfig,
-        });
-    };
-    ReduxDataProxy.prototype.writeQuery = function (_a) {
-        var data = _a.data, query = _a.query, variables = _a.variables;
-        if (this.reducerConfig.addTypename) {
-            query = addTypenameToDocument(query);
-        }
-        this.store.dispatch({
-            type: 'APOLLO_WRITE',
-            writes: [
-                {
-                    rootId: 'ROOT_QUERY',
-                    result: data,
-                    document: query,
-                    operationName: getOperationName(query),
-                    variables: variables || {},
-                },
-            ],
-        });
-    };
-    ReduxDataProxy.prototype.writeFragment = function (_a) {
-        var data = _a.data, id = _a.id, fragment = _a.fragment, fragmentName = _a.fragmentName, variables = _a.variables;
-        var document = getFragmentQueryDocument(fragment, fragmentName);
-        if (this.reducerConfig.addTypename) {
-            document = addTypenameToDocument(document);
-        }
-        this.store.dispatch({
-            type: 'APOLLO_WRITE',
-            writes: [
-                {
-                    rootId: id,
-                    result: data,
-                    document: document,
-                    operationName: getOperationName(document),
-                    variables: variables || {},
-                },
-            ],
-        });
-    };
-    return ReduxDataProxy;
-}());
-var TransactionDataProxy = (function () {
-    function TransactionDataProxy(data, reducerConfig) {
-        this.data = __assign$6({}, data);
-        this.reducerConfig = reducerConfig;
-        this.writes = [];
-        this.isFinished = false;
-    }
-    TransactionDataProxy.prototype.finish = function () {
-        this.assertNotFinished();
-        var writes = this.writes;
-        this.writes = [];
-        this.isFinished = true;
-        return writes;
-    };
-    TransactionDataProxy.prototype.readQuery = function (_a) {
-        var query = _a.query, variables = _a.variables;
-        this.assertNotFinished();
-        if (this.reducerConfig.addTypename) {
-            query = addTypenameToDocument(query);
-        }
-        return readQueryFromStore({
-            rootId: 'ROOT_QUERY',
-            store: this.data,
-            query: query,
-            variables: variables,
-            config: this.reducerConfig,
-            fragmentMatcherFunction: this.reducerConfig.fragmentMatcher,
-        });
-    };
-    TransactionDataProxy.prototype.readFragment = function (_a) {
-        var id = _a.id, fragment = _a.fragment, fragmentName = _a.fragmentName, variables = _a.variables;
-        this.assertNotFinished();
-        if (!fragment) {
-            throw new Error('fragment option is required. Please pass a GraphQL fragment to readFragment.');
-        }
-        var data = this.data;
-        var query = getFragmentQueryDocument(fragment, fragmentName);
-        if (this.reducerConfig.addTypename) {
-            query = addTypenameToDocument(query);
-        }
-        if (typeof data[id] === 'undefined') {
-            return null;
-        }
-        return readQueryFromStore({
-            rootId: id,
-            store: data,
-            query: query,
-            variables: variables,
-            config: this.reducerConfig,
-            fragmentMatcherFunction: this.reducerConfig.fragmentMatcher,
-        });
-    };
-    TransactionDataProxy.prototype.writeQuery = function (_a) {
-        var data = _a.data, query = _a.query, variables = _a.variables;
-        this.assertNotFinished();
-        if (this.reducerConfig.addTypename) {
-            query = addTypenameToDocument(query);
-        }
-        this.applyWrite({
-            rootId: 'ROOT_QUERY',
-            result: data,
-            document: query,
-            operationName: getOperationName(query),
-            variables: variables || {},
-        });
-    };
-    TransactionDataProxy.prototype.writeFragment = function (_a) {
-        var data = _a.data, id = _a.id, fragment = _a.fragment, fragmentName = _a.fragmentName, variables = _a.variables;
-        this.assertNotFinished();
-        if (!fragment) {
-            throw new Error('fragment option is required. Please pass a GraphQL fragment to writeFragment.');
-        }
-        var query = getFragmentQueryDocument(fragment, fragmentName);
-        if (this.reducerConfig.addTypename) {
-            query = addTypenameToDocument(query);
-        }
-        this.applyWrite({
-            rootId: id,
-            result: data,
-            document: query,
-            operationName: getOperationName(query),
-            variables: variables || {},
-        });
-    };
-    TransactionDataProxy.prototype.assertNotFinished = function () {
-        if (this.isFinished) {
-            throw new Error('Cannot call transaction methods after the transaction has finished.');
-        }
-    };
-    TransactionDataProxy.prototype.applyWrite = function (write) {
-        writeResultToStore({
-            result: write.result,
-            dataId: write.rootId,
-            document: write.document,
-            variables: write.variables,
-            store: this.data,
-            dataIdFromObject: this.reducerConfig.dataIdFromObject || (function () { return null; }),
-            fragmentMatcherFunction: this.reducerConfig.fragmentMatcher,
-        });
-        this.writes.push(write);
-    };
-    return TransactionDataProxy;
-}());
-
-var __assign$9 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-function replaceQueryResults(state, _a, config) {
-    var variables = _a.variables, document = _a.document, newResult = _a.newResult;
-    var clonedState = __assign$9({}, state);
-    return writeResultToStore({
-        result: newResult,
-        dataId: 'ROOT_QUERY',
-        variables: variables,
-        document: document,
-        store: clonedState,
-        dataIdFromObject: config.dataIdFromObject,
-        fragmentMatcherFunction: config.fragmentMatcher,
-    });
-}
-
-function tryFunctionOrLogError(f) {
-    try {
-        return f();
-    }
-    catch (e) {
-        if (console.error) {
-            console.error(e);
-        }
-    }
-}
-
-var __assign$4 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-function data(previousState, action, config) {
-    if (previousState === void 0) { previousState = {}; }
-    var constAction = action;
-    if (isQueryResultAction(action)) {
-        if (action.fetchMoreForQueryId) {
-            return previousState;
-        }
-        if (!graphQLResultHasError(action.result)) {
-            var clonedState = __assign$4({}, previousState);
-            var newState_1 = writeResultToStore({
-                result: action.result.data,
-                dataId: 'ROOT_QUERY',
-                document: action.document,
-                variables: action.variables,
-                store: clonedState,
-                dataIdFromObject: config.dataIdFromObject,
-                fragmentMatcherFunction: config.fragmentMatcher,
-            });
-            if (action.extraReducers) {
-                action.extraReducers.forEach(function (reducer) {
-                    newState_1 = reducer(newState_1, constAction);
-                });
-            }
-            return newState_1;
-        }
-    }
-    else if (isSubscriptionResultAction(action)) {
-        if (!graphQLResultHasError(action.result)) {
-            var clonedState = __assign$4({}, previousState);
-            var newState_2 = writeResultToStore({
-                result: action.result.data,
-                dataId: 'ROOT_SUBSCRIPTION',
-                document: action.document,
-                variables: action.variables,
-                store: clonedState,
-                dataIdFromObject: config.dataIdFromObject,
-                fragmentMatcherFunction: config.fragmentMatcher,
-            });
-            if (action.extraReducers) {
-                action.extraReducers.forEach(function (reducer) {
-                    newState_2 = reducer(newState_2, constAction);
-                });
-            }
-            return newState_2;
-        }
-    }
-    else if (isMutationResultAction(constAction)) {
-        if (!constAction.result.errors) {
-            var clonedState = __assign$4({}, previousState);
-            var newState_3 = writeResultToStore({
-                result: constAction.result.data,
-                dataId: 'ROOT_MUTATION',
-                document: constAction.document,
-                variables: constAction.variables,
-                store: clonedState,
-                dataIdFromObject: config.dataIdFromObject,
-                fragmentMatcherFunction: config.fragmentMatcher,
-            });
-            var updateQueries_1 = constAction.updateQueries;
-            if (updateQueries_1) {
-                Object.keys(updateQueries_1)
-                    .filter(function (id) { return updateQueries_1[id]; })
-                    .forEach(function (queryId) {
-                    var _a = updateQueries_1[queryId], query = _a.query, reducer = _a.reducer;
-                    var _b = diffQueryAgainstStore({
-                        store: previousState,
-                        query: query.document,
-                        variables: query.variables,
-                        returnPartialData: true,
-                        fragmentMatcherFunction: config.fragmentMatcher,
-                        config: config,
-                    }), currentQueryResult = _b.result, isMissing = _b.isMissing;
-                    if (isMissing) {
-                        return;
-                    }
-                    var nextQueryResult = tryFunctionOrLogError(function () {
-                        return reducer(currentQueryResult, {
-                            mutationResult: constAction.result,
-                            queryName: getOperationName(query.document),
-                            queryVariables: query.variables,
-                        });
-                    });
-                    if (nextQueryResult) {
-                        newState_3 = writeResultToStore({
-                            result: nextQueryResult,
-                            dataId: 'ROOT_QUERY',
-                            document: query.document,
-                            variables: query.variables,
-                            store: newState_3,
-                            dataIdFromObject: config.dataIdFromObject,
-                            fragmentMatcherFunction: config.fragmentMatcher,
-                        });
-                    }
-                });
-            }
-            if (constAction.update) {
-                var update_1 = constAction.update;
-                var proxy_1 = new TransactionDataProxy(newState_3, config);
-                tryFunctionOrLogError(function () { return update_1(proxy_1, constAction.result); });
-                var writes = proxy_1.finish();
-                newState_3 = data(newState_3, { type: 'APOLLO_WRITE', writes: writes }, config);
-            }
-            if (constAction.extraReducers) {
-                constAction.extraReducers.forEach(function (reducer) {
-                    newState_3 = reducer(newState_3, constAction);
-                });
-            }
-            return newState_3;
-        }
-    }
-    else if (isUpdateQueryResultAction(constAction)) {
-        return replaceQueryResults(previousState, constAction, config);
-    }
-    else if (isStoreResetAction(action)) {
-        return {};
-    }
-    else if (isWriteAction(action)) {
-        return action.writes.reduce(function (currentState, write) {
-            return writeResultToStore({
-                result: write.result,
-                dataId: write.rootId,
-                document: write.document,
-                variables: write.variables,
-                store: currentState,
-                dataIdFromObject: config.dataIdFromObject,
-                fragmentMatcherFunction: config.fragmentMatcher,
-            });
-        }, __assign$4({}, previousState));
-    }
-    return previousState;
-}
-
-var __assign$3 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var crashReporter = function (store) { return function (next) { return function (action) {
-    try {
-        return next(action);
-    }
-    catch (err) {
-        console.error('Caught an exception!', err);
-        console.error(err.stack);
-        throw err;
-    }
-}; }; };
-var createReducerError = function (error, action) {
-    var reducerError = { error: error };
-    if (isQueryResultAction(action)) {
-        reducerError.queryId = action.queryId;
-    }
-    else if (isSubscriptionResultAction(action)) {
-        reducerError.subscriptionId = action.subscriptionId;
-    }
-    else if (isMutationResultAction(action)) {
-        reducerError.mutationId = action.mutationId;
-    }
-    return reducerError;
-};
-function createApolloReducer(config) {
-    return function apolloReducer(state, action) {
-        if (state === void 0) { state = {}; }
-        try {
-            var newState = {
-                data: data(state.data, action, config),
-                optimistic: [],
-                reducerError: null,
-            };
-            newState.optimistic = optimistic(state.optimistic, action, newState, config);
-            if (state.data === newState.data &&
-                state.optimistic === newState.optimistic &&
-                state.reducerError === newState.reducerError) {
-                return state;
-            }
-            return newState;
-        }
-        catch (reducerError) {
-            return __assign$3({}, state, { reducerError: createReducerError(reducerError, action) });
-        }
-    };
-}
-function createApolloStore(_a) {
-    var _b = _a === void 0 ? {} : _a, _c = _b.reduxRootKey, reduxRootKey = _c === void 0 ? 'apollo' : _c, initialState = _b.initialState, _d = _b.config, config = _d === void 0 ? {} : _d, _e = _b.reportCrashes, reportCrashes = _e === void 0 ? true : _e, logger = _b.logger;
-    var enhancers = [];
-    var middlewares = [];
-    if (reportCrashes) {
-        middlewares.push(crashReporter);
-    }
-    if (logger) {
-        middlewares.push(logger);
-    }
-    if (middlewares.length > 0) {
-        enhancers.push(redux.applyMiddleware.apply(void 0, middlewares));
-    }
-    if (typeof window !== 'undefined') {
-        var anyWindow = window;
-        if (anyWindow.devToolsExtension) {
-            enhancers.push(anyWindow.devToolsExtension());
-        }
-    }
-    var compose$$1 = redux.compose;
-    if (initialState &&
-        initialState[reduxRootKey] &&
-        initialState[reduxRootKey]['queries']) {
-        throw new Error('Apollo initial state may not contain queries, only data');
-    }
-    if (initialState &&
-        initialState[reduxRootKey] &&
-        initialState[reduxRootKey]['mutations']) {
-        throw new Error('Apollo initial state may not contain mutations, only data');
-    }
-    return redux.createStore(redux.combineReducers((_f = {}, _f[reduxRootKey] = createApolloReducer(config), _f)), initialState, compose$$1.apply(void 0, enhancers));
-    var _f;
-}
-
-function isSubscription(subscription) {
-    return subscription.unsubscribe !== undefined;
-}
-var Observable = (function () {
-    function Observable(subscriberFunction) {
-        this.subscriberFunction = subscriberFunction;
-    }
-    Observable.prototype[$$observable] = function () {
-        return this;
-    };
-    Observable.prototype.subscribe = function (observer) {
-        var subscriptionOrCleanupFunction = this.subscriberFunction(observer);
-        if (isSubscription(subscriptionOrCleanupFunction)) {
-            return subscriptionOrCleanupFunction;
-        }
-        else {
-            return {
-                unsubscribe: subscriptionOrCleanupFunction,
-            };
-        }
-    };
-    return Observable;
-}());
-
-var __extends$4 = (undefined && undefined.__extends) || (function () {
-    var extendStatics = Object.setPrototypeOf ||
-        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
-    return function (d, b) {
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-function isApolloError(err) {
-    return err.hasOwnProperty('graphQLErrors');
-}
-var generateErrorMessage = function (err) {
-    var message = '';
-    if (Array.isArray(err.graphQLErrors) && err.graphQLErrors.length !== 0) {
-        err.graphQLErrors.forEach(function (graphQLError) {
-            var errorMessage = graphQLError
-                ? graphQLError.message
-                : 'Error message not found.';
-            message += "GraphQL error: " + errorMessage + "\n";
-        });
-    }
-    if (err.networkError) {
-        message += 'Network error: ' + err.networkError.message + '\n';
-    }
-    message = message.replace(/\n$/, '');
-    return message;
-};
-var ApolloError = (function (_super) {
-    __extends$4(ApolloError, _super);
-    function ApolloError(_a) {
-        var graphQLErrors = _a.graphQLErrors, networkError = _a.networkError, errorMessage = _a.errorMessage, extraInfo = _a.extraInfo;
-        var _this = _super.call(this, errorMessage) || this;
-        _this.graphQLErrors = graphQLErrors || [];
-        _this.networkError = networkError || null;
-        if (!errorMessage) {
-            _this.message = generateErrorMessage(_this);
-        }
-        else {
-            _this.message = errorMessage;
-        }
-        _this.extraInfo = extraInfo;
-        return _this;
-    }
-    return ApolloError;
-}(Error));
-
-var FetchType;
-(function (FetchType) {
-    FetchType[FetchType["normal"] = 1] = "normal";
-    FetchType[FetchType["refetch"] = 2] = "refetch";
-    FetchType[FetchType["poll"] = 3] = "poll";
-})(FetchType || (FetchType = {}));
-
 function deepFreeze(o) {
     Object.freeze(o);
     Object.getOwnPropertyNames(o).forEach(function (prop) {
@@ -2027,367 +3839,15 @@ function maybeDeepFreeze(obj) {
     return obj;
 }
 
-(function (NetworkStatus) {
-    NetworkStatus[NetworkStatus["loading"] = 1] = "loading";
-    NetworkStatus[NetworkStatus["setVariables"] = 2] = "setVariables";
-    NetworkStatus[NetworkStatus["fetchMore"] = 3] = "fetchMore";
-    NetworkStatus[NetworkStatus["refetch"] = 4] = "refetch";
-    NetworkStatus[NetworkStatus["poll"] = 6] = "poll";
-    NetworkStatus[NetworkStatus["ready"] = 7] = "ready";
-    NetworkStatus[NetworkStatus["error"] = 8] = "error";
-})(exports.NetworkStatus || (exports.NetworkStatus = {}));
-function isNetworkRequestInFlight(networkStatus) {
-    return networkStatus < 7;
-}
-
-var __extends$3 = (undefined && undefined.__extends) || (function () {
-    var extendStatics = Object.setPrototypeOf ||
-        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
-    return function (d, b) {
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-var __assign$10 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var ObservableQuery = (function (_super) {
-    __extends$3(ObservableQuery, _super);
-    function ObservableQuery(_a) {
-        var scheduler = _a.scheduler, options = _a.options, _b = _a.shouldSubscribe, shouldSubscribe = _b === void 0 ? true : _b;
-        var _this = this;
-        var queryManager = scheduler.queryManager;
-        var queryId = queryManager.generateQueryId();
-        var subscriberFunction = function (observer) {
-            return _this.onSubscribe(observer);
-        };
-        _this = _super.call(this, subscriberFunction) || this;
-        _this.isCurrentlyPolling = false;
-        _this.options = options;
-        _this.variables = _this.options.variables || {};
-        _this.scheduler = scheduler;
-        _this.queryManager = queryManager;
-        _this.queryId = queryId;
-        _this.shouldSubscribe = shouldSubscribe;
-        _this.observers = [];
-        _this.subscriptionHandles = [];
-        return _this;
-    }
-    ObservableQuery.prototype.result = function () {
-        var that = this;
-        return new Promise(function (resolve, reject) {
-            var subscription = null;
-            var observer = {
-                next: function (result) {
-                    resolve(result);
-                    var selectedObservers = that.observers.filter(function (obs) { return obs !== observer; });
-                    if (selectedObservers.length === 0) {
-                        that.queryManager.removeQuery(that.queryId);
-                    }
-                    setTimeout(function () {
-                        subscription.unsubscribe();
-                    }, 0);
-                },
-                error: function (error) {
-                    reject(error);
-                },
-            };
-            subscription = that.subscribe(observer);
-        });
-    };
-    ObservableQuery.prototype.currentResult = function () {
-        var _a = this.queryManager.getCurrentQueryResult(this, true), data = _a.data, partial = _a.partial;
-        var queryStoreValue = this.queryManager.queryStore.get(this.queryId);
-        if (queryStoreValue &&
-            ((queryStoreValue.graphQLErrors &&
-                queryStoreValue.graphQLErrors.length > 0) ||
-                queryStoreValue.networkError)) {
-            var error = new ApolloError({
-                graphQLErrors: queryStoreValue.graphQLErrors,
-                networkError: queryStoreValue.networkError,
-            });
-            return {
-                data: {},
-                loading: false,
-                networkStatus: queryStoreValue.networkStatus,
-                error: error,
-            };
-        }
-        var queryLoading = !queryStoreValue ||
-            queryStoreValue.networkStatus === exports.NetworkStatus.loading;
-        var loading = (this.options.fetchPolicy === 'network-only' && queryLoading) ||
-            (partial && this.options.fetchPolicy !== 'cache-only');
-        var networkStatus;
-        if (queryStoreValue) {
-            networkStatus = queryStoreValue.networkStatus;
-        }
-        else {
-            networkStatus = loading ? exports.NetworkStatus.loading : exports.NetworkStatus.ready;
-        }
-        var result = {
-            data: data,
-            loading: isNetworkRequestInFlight(networkStatus),
-            networkStatus: networkStatus,
-        };
-        if (!partial) {
-            var stale = false;
-            this.lastResult = __assign$10({}, result, { stale: stale });
-        }
-        return __assign$10({}, result, { partial: partial });
-    };
-    ObservableQuery.prototype.getLastResult = function () {
-        return this.lastResult;
-    };
-    ObservableQuery.prototype.refetch = function (variables) {
-        this.variables = __assign$10({}, this.variables, variables);
-        if (this.options.fetchPolicy === 'cache-only') {
-            return Promise.reject(new Error('cache-only fetchPolicy option should not be used together with query refetch.'));
-        }
-        this.options.variables = __assign$10({}, this.options.variables, this.variables);
-        var combinedOptions = __assign$10({}, this.options, { fetchPolicy: 'network-only' });
-        return this.queryManager
-            .fetchQuery(this.queryId, combinedOptions, FetchType.refetch)
-            .then(function (result) { return maybeDeepFreeze(result); });
-    };
-    ObservableQuery.prototype.fetchMore = function (fetchMoreOptions) {
-        var _this = this;
-        if (!fetchMoreOptions.updateQuery) {
-            throw new Error('updateQuery option is required. This function defines how to update the query data with the new results.');
-        }
-        return Promise.resolve()
-            .then(function () {
-            var qid = _this.queryManager.generateQueryId();
-            var combinedOptions = null;
-            if (fetchMoreOptions.query) {
-                combinedOptions = fetchMoreOptions;
-            }
-            else {
-                var variables = __assign$10({}, _this.variables, fetchMoreOptions.variables);
-                combinedOptions = __assign$10({}, _this.options, fetchMoreOptions, { variables: variables });
-            }
-            combinedOptions = __assign$10({}, combinedOptions, { query: combinedOptions.query, fetchPolicy: 'network-only' });
-            return _this.queryManager.fetchQuery(qid, combinedOptions, FetchType.normal, _this.queryId);
-        })
-            .then(function (fetchMoreResult) {
-            var data = fetchMoreResult.data;
-            var reducer = fetchMoreOptions.updateQuery;
-            var mapFn = function (previousResult, _a) {
-                var variables = _a.variables;
-                var queryVariables = variables;
-                return reducer(previousResult, {
-                    fetchMoreResult: data,
-                    queryVariables: queryVariables,
-                });
-            };
-            _this.updateQuery(mapFn);
-            return fetchMoreResult;
-        });
-    };
-    ObservableQuery.prototype.subscribeToMore = function (options) {
-        var _this = this;
-        var observable = this.queryManager.startGraphQLSubscription({
-            query: options.document,
-            variables: options.variables,
-        });
-        var subscription = observable.subscribe({
-            next: function (data) {
-                if (options.updateQuery) {
-                    var reducer_1 = options.updateQuery;
-                    var mapFn = function (previousResult, _a) {
-                        var variables = _a.variables;
-                        return reducer_1(previousResult, {
-                            subscriptionData: { data: data },
-                            variables: variables,
-                        });
-                    };
-                    _this.updateQuery(mapFn);
-                }
-            },
-            error: function (err) {
-                if (options.onError) {
-                    options.onError(err);
-                }
-                else {
-                    console.error('Unhandled GraphQL subscription error', err);
-                }
-            },
-        });
-        this.subscriptionHandles.push(subscription);
-        return function () {
-            var i = _this.subscriptionHandles.indexOf(subscription);
-            if (i >= 0) {
-                _this.subscriptionHandles.splice(i, 1);
-                subscription.unsubscribe();
-            }
-        };
-    };
-    ObservableQuery.prototype.setOptions = function (opts) {
-        var oldOptions = this.options;
-        this.options = __assign$10({}, this.options, opts);
-        if (opts.pollInterval) {
-            this.startPolling(opts.pollInterval);
-        }
-        else if (opts.pollInterval === 0) {
-            this.stopPolling();
-        }
-        var tryFetch = (oldOptions.fetchPolicy !== 'network-only' &&
-            opts.fetchPolicy === 'network-only') ||
-            (oldOptions.fetchPolicy === 'cache-only' &&
-                opts.fetchPolicy !== 'cache-only') ||
-            (oldOptions.fetchPolicy === 'standby' &&
-                opts.fetchPolicy !== 'standby') ||
-            false;
-        return this.setVariables(this.options.variables, tryFetch, opts.fetchResults);
-    };
-    ObservableQuery.prototype.setVariables = function (variables, tryFetch, fetchResults) {
-        if (tryFetch === void 0) { tryFetch = false; }
-        if (fetchResults === void 0) { fetchResults = true; }
-        var newVariables = __assign$10({}, this.variables, variables);
-        if (isEqual(newVariables, this.variables) && !tryFetch) {
-            if (this.observers.length === 0 || !fetchResults) {
-                return new Promise(function (resolve) { return resolve(); });
-            }
-            return this.result();
-        }
-        else {
-            this.variables = newVariables;
-            this.options.variables = newVariables;
-            if (this.observers.length === 0) {
-                return new Promise(function (resolve) { return resolve(); });
-            }
-            return this.queryManager
-                .fetchQuery(this.queryId, __assign$10({}, this.options, { variables: this.variables }))
-                .then(function (result) { return maybeDeepFreeze(result); });
-        }
-    };
-    ObservableQuery.prototype.updateQuery = function (mapFn) {
-        var _a = this.queryManager.getQueryWithPreviousResult(this.queryId), previousResult = _a.previousResult, variables = _a.variables, document = _a.document;
-        var newResult = tryFunctionOrLogError(function () {
-            return mapFn(previousResult, { variables: variables });
-        });
-        if (newResult) {
-            this.queryManager.store.dispatch({
-                type: 'APOLLO_UPDATE_QUERY_RESULT',
-                newResult: newResult,
-                variables: variables,
-                document: document,
-                operationName: getOperationName(document),
-            });
-        }
-    };
-    ObservableQuery.prototype.stopPolling = function () {
-        if (this.isCurrentlyPolling) {
-            this.scheduler.stopPollingQuery(this.queryId);
-            this.options.pollInterval = undefined;
-            this.isCurrentlyPolling = false;
-        }
-    };
-    ObservableQuery.prototype.startPolling = function (pollInterval) {
-        if (this.options.fetchPolicy === 'cache-first' ||
-            this.options.fetchPolicy === 'cache-only') {
-            throw new Error('Queries that specify the cache-first and cache-only fetchPolicies cannot also be polling queries.');
-        }
-        if (this.isCurrentlyPolling) {
-            this.scheduler.stopPollingQuery(this.queryId);
-            this.isCurrentlyPolling = false;
-        }
-        this.options.pollInterval = pollInterval;
-        this.isCurrentlyPolling = true;
-        this.scheduler.startPollingQuery(this.options, this.queryId);
-    };
-    ObservableQuery.prototype.onSubscribe = function (observer) {
-        var _this = this;
-        this.observers.push(observer);
-        if (observer.next && this.lastResult) {
-            observer.next(this.lastResult);
-        }
-        if (observer.error && this.lastError) {
-            observer.error(this.lastError);
-        }
-        if (this.observers.length === 1) {
-            this.setUpQuery();
-        }
-        var retQuerySubscription = {
-            unsubscribe: function () {
-                if (!_this.observers.some(function (el) { return el === observer; })) {
-                    return;
-                }
-                _this.observers = _this.observers.filter(function (obs) { return obs !== observer; });
-                if (_this.observers.length === 0) {
-                    _this.tearDownQuery();
-                }
-            },
-        };
-        return retQuerySubscription;
-    };
-    ObservableQuery.prototype.setUpQuery = function () {
-        var _this = this;
-        if (this.shouldSubscribe) {
-            this.queryManager.addObservableQuery(this.queryId, this);
-        }
-        if (!!this.options.pollInterval) {
-            if (this.options.fetchPolicy === 'cache-first' ||
-                this.options.fetchPolicy === 'cache-only') {
-                throw new Error('Queries that specify the cache-first and cache-only fetchPolicies cannot also be polling queries.');
-            }
-            this.isCurrentlyPolling = true;
-            this.scheduler.startPollingQuery(this.options, this.queryId);
-        }
-        var observer = {
-            next: function (result) {
-                _this.lastResult = result;
-                _this.observers.forEach(function (obs) {
-                    if (obs.next) {
-                        obs.next(result);
-                    }
-                });
-            },
-            error: function (error) {
-                _this.observers.forEach(function (obs) {
-                    if (obs.error) {
-                        obs.error(error);
-                    }
-                    else {
-                        console.error('Unhandled error', error.message, error.stack);
-                    }
-                });
-                _this.lastError = error;
-            },
-        };
-        this.queryManager.startQuery(this.queryId, this.options, this.queryManager.queryListenerForObserver(this.queryId, this.options, observer));
-    };
-    ObservableQuery.prototype.tearDownQuery = function () {
-        if (this.isCurrentlyPolling) {
-            this.scheduler.stopPollingQuery(this.queryId);
-            this.isCurrentlyPolling = false;
-        }
-        this.subscriptionHandles.forEach(function (sub) { return sub.unsubscribe(); });
-        this.subscriptionHandles = [];
-        this.queryManager.stopQuery(this.queryId);
-        if (this.shouldSubscribe) {
-            this.queryManager.removeObservableQuery(this.queryId);
-        }
-        this.observers = [];
-    };
-    return ObservableQuery;
-}(Observable));
-
-var haveWarned$1 = Object.create({});
+var haveWarned = Object.create({});
 function warnOnceInDevelopment(msg, type) {
     if (type === void 0) { type = 'warn'; }
     if (isProduction()) {
         return;
     }
-    if (!haveWarned$1[msg]) {
+    if (!haveWarned[msg]) {
         if (!isTest()) {
-            haveWarned$1[msg] = true;
+            haveWarned[msg] = true;
         }
         switch (type) {
             case 'error':
@@ -2399,1515 +3859,52 @@ function warnOnceInDevelopment(msg, type) {
     }
 }
 
-var IntrospectionFragmentMatcher = (function () {
-    function IntrospectionFragmentMatcher(options) {
-        if (options && options.introspectionQueryResultData) {
-            this.possibleTypesMap = this.parseIntrospectionResult(options.introspectionQueryResultData);
-            this.isReady = true;
-        }
-        else {
-            this.isReady = false;
-        }
-        this.match = this.match.bind(this);
-    }
-    IntrospectionFragmentMatcher.prototype.match = function (idValue, typeCondition, context) {
-        if (!this.isReady) {
-            throw new Error('FragmentMatcher.match() was called before FragmentMatcher.init()');
-        }
-        var obj = context.store[idValue.id];
-        if (!obj) {
-            return false;
-        }
-        if (!obj.__typename) {
-            throw new Error("Cannot match fragment because __typename property is missing: " + JSON.stringify(obj));
-        }
-        if (obj.__typename === typeCondition) {
-            return true;
-        }
-        var implementingTypes = this.possibleTypesMap[typeCondition];
-        if (implementingTypes && implementingTypes.indexOf(obj.__typename) > -1) {
-            return true;
-        }
-        return false;
-    };
-    IntrospectionFragmentMatcher.prototype.parseIntrospectionResult = function (introspectionResultData) {
-        var typeMap = {};
-        introspectionResultData.__schema.types.forEach(function (type) {
-            if (type.kind === 'UNION' || type.kind === 'INTERFACE') {
-                typeMap[type.name] = type.possibleTypes.map(function (implementingType) { return implementingType.name; });
-            }
-        });
-        return typeMap;
-    };
-    return IntrospectionFragmentMatcher;
-}());
-var haveWarned = false;
-var HeuristicFragmentMatcher = (function () {
-    function HeuristicFragmentMatcher() {
-    }
-    HeuristicFragmentMatcher.prototype.ensureReady = function () {
-        return Promise.resolve();
-    };
-    HeuristicFragmentMatcher.prototype.canBypassInit = function () {
-        return true;
-    };
-    HeuristicFragmentMatcher.prototype.match = function (idValue, typeCondition, context) {
-        var obj = context.store[idValue.id];
-        if (!obj) {
-            return false;
-        }
-        if (!obj.__typename) {
-            if (!haveWarned) {
-                console.warn("You're using fragments in your queries, but either don't have the addTypename:\n  true option set in Apollo Client, or you are trying to write a fragment to the store without the __typename.\n   Please turn on the addTypename option and include __typename when writing fragments so that Apollo Client\n   can accurately match fragments.");
-                console.warn('Could not find __typename on Fragment ', typeCondition, obj);
-                console.warn("DEPRECATION WARNING: using fragments without __typename is unsupported behavior " +
-                    "and will be removed in future versions of Apollo client. You should fix this and set addTypename to true now.");
-                if (!isTest()) {
-                    haveWarned = true;
-                }
-            }
-            context.returnPartialData = true;
-            return true;
-        }
-        if (obj.__typename === typeCondition) {
-            return true;
-        }
-        warnOnceInDevelopment("You are using the simple (heuristic) fragment matcher, but your queries contain union or interface types.\n     Apollo Client will not be able to able to accurately map fragments." +
-            "To make this error go away, use the IntrospectionFragmentMatcher as described in the docs: " +
-            "http://dev.apollodata.com/react/initialization.html#fragment-matcher", 'error');
-        context.returnPartialData = true;
-        return true;
-    };
-    return HeuristicFragmentMatcher;
-}());
-
-var Deduplicator = (function () {
-    function Deduplicator(networkInterface) {
-        this.networkInterface = networkInterface;
-        this.inFlightRequestPromises = {};
-    }
-    Deduplicator.prototype.query = function (request, deduplicate) {
-        var _this = this;
-        if (deduplicate === void 0) { deduplicate = true; }
-        if (!deduplicate) {
-            return this.networkInterface.query(request);
-        }
-        var key = this.getKey(request);
-        if (!this.inFlightRequestPromises[key]) {
-            this.inFlightRequestPromises[key] = this.networkInterface.query(request);
-        }
-        return this.inFlightRequestPromises[key]
-            .then(function (res) {
-            delete _this.inFlightRequestPromises[key];
-            return res;
-        })
-            .catch(function (err) {
-            delete _this.inFlightRequestPromises[key];
-            throw err;
-        });
-    };
-    Deduplicator.prototype.getKey = function (request) {
-        return printer.print(request.query) + "|" + JSON.stringify(request.variables) + "|" + request.operationName;
-    };
-    return Deduplicator;
-}());
-
-var __assign$13 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var QueryStore = (function () {
-    function QueryStore() {
-        this.store = {};
-    }
-    QueryStore.prototype.getStore = function () {
-        return this.store;
-    };
-    QueryStore.prototype.get = function (queryId) {
-        return this.store[queryId];
-    };
-    QueryStore.prototype.initQuery = function (query) {
-        var previousQuery = this.store[query.queryId];
-        if (previousQuery && previousQuery.queryString !== query.queryString) {
-            throw new Error('Internal Error: may not update existing query string in store');
-        }
-        var isSetVariables = false;
-        var previousVariables = null;
-        if (query.storePreviousVariables &&
-            previousQuery &&
-            previousQuery.networkStatus !== exports.NetworkStatus.loading) {
-            if (!isEqual(previousQuery.variables, query.variables)) {
-                isSetVariables = true;
-                previousVariables = previousQuery.variables;
-            }
-        }
-        var networkStatus;
-        if (isSetVariables) {
-            networkStatus = exports.NetworkStatus.setVariables;
-        }
-        else if (query.isPoll) {
-            networkStatus = exports.NetworkStatus.poll;
-        }
-        else if (query.isRefetch) {
-            networkStatus = exports.NetworkStatus.refetch;
-        }
-        else {
-            networkStatus = exports.NetworkStatus.loading;
-        }
-        this.store[query.queryId] = {
-            queryString: query.queryString,
-            document: query.document,
-            variables: query.variables,
-            previousVariables: previousVariables,
-            networkError: null,
-            graphQLErrors: [],
-            networkStatus: networkStatus,
-            metadata: query.metadata,
-        };
-        if (typeof query.fetchMoreForQueryId === 'string') {
-            this.store[query.fetchMoreForQueryId].networkStatus =
-                exports.NetworkStatus.fetchMore;
-        }
-    };
-    QueryStore.prototype.markQueryResult = function (queryId, result, fetchMoreForQueryId) {
-        if (!this.store[queryId]) {
-            return;
-        }
-        this.store[queryId].networkError = null;
-        this.store[queryId].graphQLErrors =
-            result.errors && result.errors.length ? result.errors : [];
-        this.store[queryId].previousVariables = null;
-        this.store[queryId].networkStatus = exports.NetworkStatus.ready;
-        if (typeof fetchMoreForQueryId === 'string') {
-            this.store[fetchMoreForQueryId].networkStatus = exports.NetworkStatus.ready;
-        }
-    };
-    QueryStore.prototype.markQueryError = function (queryId, error, fetchMoreForQueryId) {
-        if (!this.store[queryId]) {
-            return;
-        }
-        this.store[queryId].networkError = error;
-        this.store[queryId].networkStatus = exports.NetworkStatus.error;
-        if (typeof fetchMoreForQueryId === 'string') {
-            this.markQueryError(fetchMoreForQueryId, error, undefined);
-        }
-    };
-    QueryStore.prototype.markQueryResultClient = function (queryId, complete) {
-        if (!this.store[queryId]) {
-            return;
-        }
-        this.store[queryId].networkError = null;
-        this.store[queryId].previousVariables = null;
-        this.store[queryId].networkStatus = complete
-            ? exports.NetworkStatus.ready
-            : exports.NetworkStatus.loading;
-    };
-    QueryStore.prototype.stopQuery = function (queryId) {
-        delete this.store[queryId];
-    };
-    QueryStore.prototype.reset = function (observableQueryIds) {
-        var _this = this;
-        this.store = Object.keys(this.store)
-            .filter(function (queryId) {
-            return observableQueryIds.indexOf(queryId) > -1;
-        })
-            .reduce(function (res, key) {
-            res[key] = __assign$13({}, _this.store[key], { networkStatus: exports.NetworkStatus.loading });
-            return res;
-        }, {});
-    };
-    return QueryStore;
-}());
-
-function createStoreReducer(resultReducer, document, variables, config) {
-    return function (store, action) {
-        var _a = diffQueryAgainstStore({
-            store: store,
-            query: document,
-            variables: variables,
-            returnPartialData: true,
-            fragmentMatcherFunction: config.fragmentMatcher,
-            config: config,
-        }), result = _a.result, isMissing = _a.isMissing;
-        if (isMissing) {
-            return store;
-        }
-        var nextResult;
-        try {
-            nextResult = resultReducer(result, action, variables);
-        }
-        catch (err) {
-            console.warn('Unhandled error in result reducer', err);
-            throw err;
-        }
-        if (result !== nextResult) {
-            return writeResultToStore({
-                dataId: 'ROOT_QUERY',
-                result: nextResult,
-                store: store,
-                document: document,
-                variables: variables,
-                dataIdFromObject: config.dataIdFromObject,
-                fragmentMatcherFunction: config.fragmentMatcher,
-            });
-        }
-        return store;
-    };
-}
-
-var MutationStore = (function () {
-    function MutationStore() {
-        this.store = {};
-    }
-    MutationStore.prototype.getStore = function () {
-        return this.store;
-    };
-    MutationStore.prototype.get = function (mutationId) {
-        return this.store[mutationId];
-    };
-    MutationStore.prototype.initMutation = function (mutationId, mutationString, variables) {
-        this.store[mutationId] = {
-            mutationString: mutationString,
-            variables: variables || {},
-            loading: true,
-            error: null,
-        };
-    };
-    MutationStore.prototype.markMutationError = function (mutationId, error) {
-        this.store[mutationId].loading = false;
-        this.store[mutationId].error = error;
-    };
-    MutationStore.prototype.markMutationResult = function (mutationId) {
-        this.store[mutationId].loading = false;
-        this.store[mutationId].error = null;
-    };
-    MutationStore.prototype.reset = function () {
-        this.store = {};
-    };
-    return MutationStore;
-}());
-
-var __assign$14 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var QueryScheduler = (function () {
-    function QueryScheduler(_a) {
-        var queryManager = _a.queryManager;
-        this.queryManager = queryManager;
-        this.pollingTimers = {};
-        this.inFlightQueries = {};
-        this.registeredQueries = {};
-        this.intervalQueries = {};
-    }
-    QueryScheduler.prototype.checkInFlight = function (queryId) {
-        var query = this.queryManager.queryStore.get(queryId);
-        return (query &&
-            query.networkStatus !== exports.NetworkStatus.ready &&
-            query.networkStatus !== exports.NetworkStatus.error);
-    };
-    QueryScheduler.prototype.fetchQuery = function (queryId, options, fetchType) {
-        var _this = this;
-        return new Promise(function (resolve, reject) {
-            _this.queryManager
-                .fetchQuery(queryId, options, fetchType)
-                .then(function (result) {
-                resolve(result);
-            })
-                .catch(function (error) {
-                reject(error);
-            });
-        });
-    };
-    QueryScheduler.prototype.startPollingQuery = function (options, queryId, listener) {
-        if (!options.pollInterval) {
-            throw new Error('Attempted to start a polling query without a polling interval.');
-        }
-        if (this.queryManager.ssrMode) {
-            return queryId;
-        }
-        this.registeredQueries[queryId] = options;
-        if (listener) {
-            this.queryManager.addQueryListener(queryId, listener);
-        }
-        this.addQueryOnInterval(queryId, options);
-        return queryId;
-    };
-    QueryScheduler.prototype.stopPollingQuery = function (queryId) {
-        delete this.registeredQueries[queryId];
-    };
-    QueryScheduler.prototype.fetchQueriesOnInterval = function (interval) {
-        var _this = this;
-        this.intervalQueries[interval] = this.intervalQueries[interval].filter(function (queryId) {
-            if (!_this.registeredQueries.hasOwnProperty(queryId)) {
-                return false;
-            }
-            if (_this.checkInFlight(queryId)) {
-                return true;
-            }
-            var queryOptions = _this.registeredQueries[queryId];
-            var pollingOptions = __assign$14({}, queryOptions);
-            pollingOptions.fetchPolicy = 'network-only';
-            _this.fetchQuery(queryId, pollingOptions, FetchType.poll);
-            return true;
-        });
-        if (this.intervalQueries[interval].length === 0) {
-            clearInterval(this.pollingTimers[interval]);
-            delete this.intervalQueries[interval];
-        }
-    };
-    QueryScheduler.prototype.addQueryOnInterval = function (queryId, queryOptions) {
-        var _this = this;
-        var interval = queryOptions.pollInterval;
-        if (!interval) {
-            throw new Error("A poll interval is required to start polling query with id '" + queryId + "'.");
-        }
-        if (this.intervalQueries.hasOwnProperty(interval.toString()) &&
-            this.intervalQueries[interval].length > 0) {
-            this.intervalQueries[interval].push(queryId);
-        }
-        else {
-            this.intervalQueries[interval] = [queryId];
-            this.pollingTimers[interval] = setInterval(function () {
-                _this.fetchQueriesOnInterval(interval);
-            }, interval);
-        }
-    };
-    QueryScheduler.prototype.registerPollingQuery = function (queryOptions) {
-        if (!queryOptions.pollInterval) {
-            throw new Error('Attempted to register a non-polling query with the scheduler.');
-        }
-        return new ObservableQuery({
-            scheduler: this,
-            options: queryOptions,
-        });
-    };
-    return QueryScheduler;
-}());
-
-var __assign$12 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var QueryManager = (function () {
-    function QueryManager(_a) {
-        var networkInterface = _a.networkInterface, store = _a.store, reduxRootSelector = _a.reduxRootSelector, _b = _a.reducerConfig, reducerConfig = _b === void 0 ? {} : _b, fragmentMatcher = _a.fragmentMatcher, _c = _a.addTypename, addTypename = _c === void 0 ? true : _c, _d = _a.queryDeduplication, queryDeduplication = _d === void 0 ? false : _d, _e = _a.ssrMode, ssrMode = _e === void 0 ? false : _e;
-        var _this = this;
-        this.mutationStore = new MutationStore();
-        this.queryStore = new QueryStore();
-        this.idCounter = 1;
-        this.lastRequestId = {};
-        this.disableBroadcasting = false;
-        this.networkInterface = networkInterface;
-        this.deduplicator = new Deduplicator(networkInterface);
-        this.store = store;
-        this.reduxRootSelector = reduxRootSelector;
-        this.reducerConfig = reducerConfig;
-        this.pollingTimers = {};
-        this.queryListeners = {};
-        this.queryDocuments = {};
-        this.addTypename = addTypename;
-        this.queryDeduplication = queryDeduplication;
-        this.ssrMode = ssrMode;
-        if (typeof fragmentMatcher === 'undefined') {
-            this.fragmentMatcher = new HeuristicFragmentMatcher();
-        }
-        else {
-            this.fragmentMatcher = fragmentMatcher;
-        }
-        this.scheduler = new QueryScheduler({
-            queryManager: this,
-        });
-        this.fetchQueryPromises = {};
-        this.observableQueries = {};
-        this.queryIdsByName = {};
-        if (this.store['subscribe']) {
-            var currentStoreData_1;
-            this.store['subscribe'](function () {
-                var previousStoreData = currentStoreData_1 || {};
-                var previousStoreHasData = Object.keys(previousStoreData).length;
-                currentStoreData_1 = _this.getApolloState();
-                if (isEqual(previousStoreData, currentStoreData_1) &&
-                    previousStoreHasData) {
-                    return;
-                }
-                _this.broadcastQueries();
-            });
-        }
-    }
-    QueryManager.prototype.broadcastNewStore = function (store) {
-        this.broadcastQueries();
-    };
-    QueryManager.prototype.mutate = function (_a) {
-        var _this = this;
-        var mutation = _a.mutation, variables = _a.variables, optimisticResponse = _a.optimisticResponse, updateQueriesByName = _a.updateQueries, _b = _a.refetchQueries, refetchQueries = _b === void 0 ? [] : _b, updateWithProxyFn = _a.update;
-        if (!mutation) {
-            throw new Error('mutation option is required. You must specify your GraphQL document in the mutation option.');
-        }
-        var mutationId = this.generateQueryId();
-        if (this.addTypename) {
-            mutation = addTypenameToDocument(mutation);
-        }
-        variables = assign({}, getDefaultValues(getMutationDefinition(mutation)), variables);
-        var mutationString = printer.print(mutation);
-        var request = {
-            query: mutation,
-            variables: variables,
-            operationName: getOperationName(mutation),
-        };
-        this.queryDocuments[mutationId] = mutation;
-        var generateUpdateQueriesInfo = function () {
-            var ret = {};
-            if (updateQueriesByName) {
-                Object.keys(updateQueriesByName).forEach(function (queryName) {
-                    return (_this.queryIdsByName[queryName] || []).forEach(function (queryId) {
-                        ret[queryId] = {
-                            reducer: updateQueriesByName[queryName],
-                            query: _this.queryStore.get(queryId),
-                        };
-                    });
-                });
-            }
-            return ret;
-        };
-        this.store.dispatch({
-            type: 'APOLLO_MUTATION_INIT',
-            mutationString: mutationString,
-            mutation: mutation,
-            variables: variables || {},
-            operationName: getOperationName(mutation),
-            mutationId: mutationId,
-            optimisticResponse: optimisticResponse,
-            extraReducers: this.getExtraReducers(),
-            updateQueries: generateUpdateQueriesInfo(),
-            update: updateWithProxyFn,
-        });
-        this.mutationStore.initMutation(mutationId, mutationString, variables);
-        return new Promise(function (resolve, reject) {
-            _this.networkInterface
-                .query(request)
-                .then(function (result) {
-                if (result.errors) {
-                    var error = new ApolloError({
-                        graphQLErrors: result.errors,
-                    });
-                    _this.store.dispatch({
-                        type: 'APOLLO_MUTATION_ERROR',
-                        error: error,
-                        mutationId: mutationId,
-                    });
-                    _this.mutationStore.markMutationError(mutationId, error);
-                    delete _this.queryDocuments[mutationId];
-                    reject(error);
-                    return;
-                }
-                _this.store.dispatch({
-                    type: 'APOLLO_MUTATION_RESULT',
-                    result: result,
-                    mutationId: mutationId,
-                    document: mutation,
-                    operationName: getOperationName(mutation),
-                    variables: variables || {},
-                    extraReducers: _this.getExtraReducers(),
-                    updateQueries: generateUpdateQueriesInfo(),
-                    update: updateWithProxyFn,
-                });
-                _this.mutationStore.markMutationResult(mutationId);
-                var reducerError = _this.getApolloState().reducerError;
-                if (reducerError && reducerError.mutationId === mutationId) {
-                    reject(reducerError.error);
-                    return;
-                }
-                if (typeof refetchQueries[0] === 'string') {
-                    refetchQueries.forEach(function (name) {
-                        _this.refetchQueryByName(name);
-                    });
-                }
-                else {
-                    refetchQueries.forEach(function (pureQuery) {
-                        _this.query({
-                            query: pureQuery.query,
-                            variables: pureQuery.variables,
-                            fetchPolicy: 'network-only',
-                        });
-                    });
-                }
-                delete _this.queryDocuments[mutationId];
-                resolve(result);
-            })
-                .catch(function (err) {
-                _this.store.dispatch({
-                    type: 'APOLLO_MUTATION_ERROR',
-                    error: err,
-                    mutationId: mutationId,
-                });
-                delete _this.queryDocuments[mutationId];
-                reject(new ApolloError({
-                    networkError: err,
-                }));
-            });
-        });
-    };
-    QueryManager.prototype.fetchQuery = function (queryId, options, fetchType, fetchMoreForQueryId) {
-        var _this = this;
-        var _a = options.variables, variables = _a === void 0 ? {} : _a, _b = options.metadata, metadata = _b === void 0 ? null : _b, _c = options.fetchPolicy, fetchPolicy = _c === void 0 ? 'cache-first' : _c;
-        var queryDoc = this.transformQueryDocument(options).queryDoc;
-        var queryString = printer.print(queryDoc);
-        var storeResult;
-        var needToFetch = fetchPolicy === 'network-only';
-        if (fetchType !== FetchType.refetch && fetchPolicy !== 'network-only') {
-            var _d = diffQueryAgainstStore({
-                query: queryDoc,
-                store: this.reduxRootSelector(this.store.getState()).data,
-                variables: variables,
-                returnPartialData: true,
-                fragmentMatcherFunction: this.fragmentMatcher.match,
-                config: this.reducerConfig,
-            }), isMissing = _d.isMissing, result = _d.result;
-            needToFetch = isMissing || fetchPolicy === 'cache-and-network';
-            storeResult = result;
-        }
-        var shouldFetch = needToFetch && fetchPolicy !== 'cache-only' && fetchPolicy !== 'standby';
-        var requestId = this.generateRequestId();
-        this.queryDocuments[queryId] = queryDoc;
-        this.queryStore.initQuery({
-            queryId: queryId,
-            queryString: queryString,
-            document: queryDoc,
-            storePreviousVariables: shouldFetch,
-            variables: variables,
-            isPoll: fetchType === FetchType.poll,
-            isRefetch: fetchType === FetchType.refetch,
-            metadata: metadata,
-            fetchMoreForQueryId: fetchMoreForQueryId,
-        });
-        this.broadcastQueries();
-        if (QueryManager.EMIT_REDUX_ACTIONS) {
-            this.store.dispatch({
-                type: 'APOLLO_QUERY_INIT',
-                queryString: queryString,
-                document: queryDoc,
-                operationName: getOperationName(queryDoc),
-                variables: variables,
-                fetchPolicy: fetchPolicy,
-                queryId: queryId,
-                requestId: requestId,
-                storePreviousVariables: shouldFetch,
-                isPoll: fetchType === FetchType.poll,
-                isRefetch: fetchType === FetchType.refetch,
-                fetchMoreForQueryId: fetchMoreForQueryId,
-                metadata: metadata,
-            });
-        }
-        this.lastRequestId[queryId] = requestId;
-        var shouldDispatchClientResult = !shouldFetch || fetchPolicy === 'cache-and-network';
-        if (shouldDispatchClientResult) {
-            this.queryStore.markQueryResultClient(queryId, !shouldFetch);
-            this.broadcastQueries();
-            if (QueryManager.EMIT_REDUX_ACTIONS) {
-                this.store.dispatch({
-                    type: 'APOLLO_QUERY_RESULT_CLIENT',
-                    result: { data: storeResult },
-                    variables: variables,
-                    document: queryDoc,
-                    operationName: getOperationName(queryDoc),
-                    complete: !shouldFetch,
-                    queryId: queryId,
-                    requestId: requestId,
-                });
-            }
-        }
-        if (shouldFetch) {
-            var networkResult = this.fetchRequest({
-                requestId: requestId,
-                queryId: queryId,
-                document: queryDoc,
-                options: options,
-                fetchMoreForQueryId: fetchMoreForQueryId,
-            }).catch(function (error) {
-                if (isApolloError(error)) {
-                    throw error;
-                }
-                else {
-                    if (requestId >= (_this.lastRequestId[queryId] || 1)) {
-                        if (QueryManager.EMIT_REDUX_ACTIONS) {
-                            _this.store.dispatch({
-                                type: 'APOLLO_QUERY_ERROR',
-                                error: error,
-                                queryId: queryId,
-                                requestId: requestId,
-                                fetchMoreForQueryId: fetchMoreForQueryId,
-                            });
-                        }
-                        _this.queryStore.markQueryError(queryId, error, fetchMoreForQueryId);
-                        _this.broadcastQueries();
-                    }
-                    _this.removeFetchQueryPromise(requestId);
-                    throw new ApolloError({
-                        networkError: error,
-                    });
-                }
-            });
-            if (fetchPolicy !== 'cache-and-network') {
-                return networkResult;
-            }
-        }
-        return Promise.resolve({ data: storeResult });
-    };
-    QueryManager.prototype.queryListenerForObserver = function (queryId, options, observer) {
-        var _this = this;
-        var previouslyHadError = false;
-        return function (queryStoreValue) {
-            if (!queryStoreValue) {
-                return;
-            }
-            queryStoreValue = _this.queryStore.get(queryId);
-            var storedQuery = _this.observableQueries[queryId];
-            var observableQuery = storedQuery ? storedQuery.observableQuery : null;
-            var fetchPolicy = observableQuery
-                ? observableQuery.options.fetchPolicy
-                : options.fetchPolicy;
-            if (fetchPolicy === 'standby') {
-                return;
-            }
-            var lastResult = observableQuery
-                ? observableQuery.getLastResult()
-                : null;
-            var shouldNotifyIfLoading = queryStoreValue.previousVariables ||
-                fetchPolicy === 'cache-only' ||
-                fetchPolicy === 'cache-and-network';
-            var networkStatusChanged = lastResult &&
-                queryStoreValue.networkStatus !== lastResult.networkStatus;
-            if (!isNetworkRequestInFlight(queryStoreValue.networkStatus) ||
-                (networkStatusChanged && options.notifyOnNetworkStatusChange) ||
-                shouldNotifyIfLoading) {
-                if ((queryStoreValue.graphQLErrors &&
-                    queryStoreValue.graphQLErrors.length > 0) ||
-                    queryStoreValue.networkError) {
-                    var apolloError_1 = new ApolloError({
-                        graphQLErrors: queryStoreValue.graphQLErrors,
-                        networkError: queryStoreValue.networkError,
-                    });
-                    previouslyHadError = true;
-                    if (observer.error) {
-                        try {
-                            observer.error(apolloError_1);
-                        }
-                        catch (e) {
-                            setTimeout(function () {
-                                throw e;
-                            }, 0);
-                        }
-                    }
-                    else {
-                        setTimeout(function () {
-                            throw apolloError_1;
-                        }, 0);
-                        if (!isProduction()) {
-                            console.info('An unhandled error was thrown because no error handler is registered ' +
-                                'for the query ' +
-                                queryStoreValue.queryString);
-                        }
-                    }
-                }
-                else {
-                    try {
-                        var _a = diffQueryAgainstStore({
-                            store: _this.getDataWithOptimisticResults(),
-                            query: _this.queryDocuments[queryId],
-                            variables: queryStoreValue.previousVariables || queryStoreValue.variables,
-                            config: _this.reducerConfig,
-                            fragmentMatcherFunction: _this.fragmentMatcher.match,
-                            previousResult: lastResult && lastResult.data,
-                        }), data = _a.result, isMissing = _a.isMissing;
-                        var resultFromStore = void 0;
-                        if (isMissing && fetchPolicy !== 'cache-only') {
-                            resultFromStore = {
-                                data: lastResult && lastResult.data,
-                                loading: isNetworkRequestInFlight(queryStoreValue.networkStatus),
-                                networkStatus: queryStoreValue.networkStatus,
-                                stale: true,
-                            };
-                        }
-                        else {
-                            resultFromStore = {
-                                data: data,
-                                loading: isNetworkRequestInFlight(queryStoreValue.networkStatus),
-                                networkStatus: queryStoreValue.networkStatus,
-                                stale: false,
-                            };
-                        }
-                        if (observer.next) {
-                            var isDifferentResult = !(lastResult &&
-                                resultFromStore &&
-                                lastResult.networkStatus === resultFromStore.networkStatus &&
-                                lastResult.stale === resultFromStore.stale &&
-                                lastResult.data === resultFromStore.data);
-                            if (isDifferentResult || previouslyHadError) {
-                                try {
-                                    observer.next(maybeDeepFreeze(resultFromStore));
-                                }
-                                catch (e) {
-                                    setTimeout(function () {
-                                        throw e;
-                                    }, 0);
-                                }
-                            }
-                        }
-                        previouslyHadError = false;
-                    }
-                    catch (error) {
-                        previouslyHadError = true;
-                        if (observer.error) {
-                            observer.error(new ApolloError({
-                                networkError: error,
-                            }));
-                        }
-                        return;
-                    }
-                }
-            }
-        };
-    };
-    QueryManager.prototype.watchQuery = function (options, shouldSubscribe) {
-        if (shouldSubscribe === void 0) { shouldSubscribe = true; }
-        if (options.returnPartialData) {
-            throw new Error('returnPartialData option is no longer supported since Apollo Client 1.0.');
-        }
-        if (options.forceFetch) {
-            throw new Error('forceFetch option is no longer supported since Apollo Client 1.0. Use fetchPolicy instead.');
-        }
-        if (options.noFetch) {
-            throw new Error('noFetch option is no longer supported since Apollo Client 1.0. Use fetchPolicy instead.');
-        }
-        if (options.fetchPolicy === 'standby') {
-            throw new Error('client.watchQuery cannot be called with fetchPolicy set to "standby"');
-        }
-        var queryDefinition = getQueryDefinition(options.query);
-        if (queryDefinition.variableDefinitions &&
-            queryDefinition.variableDefinitions.length) {
-            var defaultValues = getDefaultValues(queryDefinition);
-            options.variables = assign({}, defaultValues, options.variables);
-        }
-        if (typeof options.notifyOnNetworkStatusChange === 'undefined') {
-            options.notifyOnNetworkStatusChange = false;
-        }
-        var transformedOptions = __assign$12({}, options);
-        var observableQuery = new ObservableQuery({
-            scheduler: this.scheduler,
-            options: transformedOptions,
-            shouldSubscribe: shouldSubscribe,
-        });
-        return observableQuery;
-    };
-    QueryManager.prototype.query = function (options) {
-        var _this = this;
-        if (!options.query) {
-            throw new Error('query option is required. You must specify your GraphQL document in the query option.');
-        }
-        if (options.query.kind !== 'Document') {
-            throw new Error('You must wrap the query string in a "gql" tag.');
-        }
-        if (options.returnPartialData) {
-            throw new Error('returnPartialData option only supported on watchQuery.');
-        }
-        if (options.pollInterval) {
-            throw new Error('pollInterval option only supported on watchQuery.');
-        }
-        if (options.forceFetch) {
-            throw new Error('forceFetch option is no longer supported since Apollo Client 1.0. Use fetchPolicy instead.');
-        }
-        if (options.noFetch) {
-            throw new Error('noFetch option is no longer supported since Apollo Client 1.0. Use fetchPolicy instead.');
-        }
-        if (typeof options.notifyOnNetworkStatusChange !== 'undefined') {
-            throw new Error('Cannot call "query" with "notifyOnNetworkStatusChange" option. Only "watchQuery" has that option.');
-        }
-        options.notifyOnNetworkStatusChange = false;
-        var requestId = this.idCounter;
-        var resPromise = new Promise(function (resolve, reject) {
-            _this.addFetchQueryPromise(requestId, resPromise, resolve, reject);
-            return _this.watchQuery(options, false)
-                .result()
-                .then(function (result) {
-                _this.removeFetchQueryPromise(requestId);
-                resolve(result);
-            })
-                .catch(function (error) {
-                _this.removeFetchQueryPromise(requestId);
-                reject(error);
-            });
-        });
-        return resPromise;
-    };
-    QueryManager.prototype.generateQueryId = function () {
-        var queryId = this.idCounter.toString();
-        this.idCounter++;
-        return queryId;
-    };
-    QueryManager.prototype.stopQueryInStore = function (queryId) {
-        this.queryStore.stopQuery(queryId);
-        this.broadcastQueries();
-        if (QueryManager.EMIT_REDUX_ACTIONS) {
-            this.store.dispatch({
-                type: 'APOLLO_QUERY_STOP',
-                queryId: queryId,
-            });
-        }
-    };
-    QueryManager.prototype.getApolloState = function () {
-        return this.reduxRootSelector(this.store.getState());
-    };
-    QueryManager.prototype.selectApolloState = function (store) {
-        return this.reduxRootSelector(store.getState());
-    };
-    QueryManager.prototype.getInitialState = function () {
-        return { data: this.getApolloState().data };
-    };
-    QueryManager.prototype.getDataWithOptimisticResults = function () {
-        return getDataWithOptimisticResults(this.getApolloState());
-    };
-    QueryManager.prototype.addQueryListener = function (queryId, listener) {
-        this.queryListeners[queryId] = this.queryListeners[queryId] || [];
-        this.queryListeners[queryId].push(listener);
-    };
-    QueryManager.prototype.addFetchQueryPromise = function (requestId, promise, resolve, reject) {
-        this.fetchQueryPromises[requestId.toString()] = {
-            promise: promise,
-            resolve: resolve,
-            reject: reject,
-        };
-    };
-    QueryManager.prototype.removeFetchQueryPromise = function (requestId) {
-        delete this.fetchQueryPromises[requestId.toString()];
-    };
-    QueryManager.prototype.addObservableQuery = function (queryId, observableQuery) {
-        this.observableQueries[queryId] = { observableQuery: observableQuery };
-        var queryDef = getQueryDefinition(observableQuery.options.query);
-        if (queryDef.name && queryDef.name.value) {
-            var queryName = queryDef.name.value;
-            this.queryIdsByName[queryName] = this.queryIdsByName[queryName] || [];
-            this.queryIdsByName[queryName].push(observableQuery.queryId);
-        }
-    };
-    QueryManager.prototype.removeObservableQuery = function (queryId) {
-        var observableQuery = this.observableQueries[queryId].observableQuery;
-        var definition = getQueryDefinition(observableQuery.options.query);
-        var queryName = definition.name ? definition.name.value : null;
-        delete this.observableQueries[queryId];
-        if (queryName) {
-            this.queryIdsByName[queryName] = this.queryIdsByName[queryName].filter(function (val) {
-                return !(observableQuery.queryId === val);
-            });
-        }
-    };
-    QueryManager.prototype.resetStore = function () {
-        var _this = this;
-        Object.keys(this.fetchQueryPromises).forEach(function (key) {
-            var reject = _this.fetchQueryPromises[key].reject;
-            reject(new Error('Store reset while query was in flight.'));
-        });
-        this.queryStore.reset(Object.keys(this.observableQueries));
-        this.store.dispatch({
-            type: 'APOLLO_STORE_RESET',
-            observableQueryIds: Object.keys(this.observableQueries),
-        });
-        this.mutationStore.reset();
-        var observableQueryPromises = [];
-        Object.keys(this.observableQueries).forEach(function (queryId) {
-            var storeQuery = _this.queryStore.get(queryId);
-            var fetchPolicy = _this.observableQueries[queryId].observableQuery
-                .options.fetchPolicy;
-            if (fetchPolicy !== 'cache-only' && fetchPolicy !== 'standby') {
-                observableQueryPromises.push(_this.observableQueries[queryId].observableQuery.refetch());
-            }
-        });
-        return Promise.all(observableQueryPromises);
-    };
-    QueryManager.prototype.startQuery = function (queryId, options, listener) {
-        this.addQueryListener(queryId, listener);
-        this.fetchQuery(queryId, options)
-            .catch(function (error) { return undefined; });
-        return queryId;
-    };
-    QueryManager.prototype.startGraphQLSubscription = function (options) {
-        var _this = this;
-        var query = options.query;
-        var transformedDoc = query;
-        if (this.addTypename) {
-            transformedDoc = addTypenameToDocument(transformedDoc);
-        }
-        var variables = assign({}, getDefaultValues(getOperationDefinition(query)), options.variables);
-        var request = {
-            query: transformedDoc,
-            variables: variables,
-            operationName: getOperationName(transformedDoc),
-        };
-        var subId;
-        var observers = [];
-        return new Observable(function (observer) {
-            observers.push(observer);
-            if (observers.length === 1) {
-                var handler = function (error, result) {
-                    if (error) {
-                        observers.forEach(function (obs) {
-                            if (obs.error) {
-                                obs.error(error);
-                            }
-                        });
-                    }
-                    else {
-                        _this.store.dispatch({
-                            type: 'APOLLO_SUBSCRIPTION_RESULT',
-                            document: transformedDoc,
-                            operationName: getOperationName(transformedDoc),
-                            result: { data: result },
-                            variables: variables,
-                            subscriptionId: subId,
-                            extraReducers: _this.getExtraReducers(),
-                        });
-                        observers.forEach(function (obs) {
-                            if (obs.next) {
-                                obs.next(result);
-                            }
-                        });
-                    }
-                };
-                subId = _this
-                    .networkInterface.subscribe(request, handler);
-            }
-            return {
-                unsubscribe: function () {
-                    observers = observers.filter(function (obs) { return obs !== observer; });
-                    if (observers.length === 0) {
-                        _this.networkInterface.unsubscribe(subId);
-                    }
-                },
-                _networkSubscriptionId: subId,
-            };
-        });
-    };
-    QueryManager.prototype.removeQuery = function (queryId) {
-        delete this.queryListeners[queryId];
-        delete this.queryDocuments[queryId];
-    };
-    QueryManager.prototype.stopQuery = function (queryId) {
-        this.removeQuery(queryId);
-        this.stopQueryInStore(queryId);
-    };
-    QueryManager.prototype.getCurrentQueryResult = function (observableQuery, isOptimistic) {
-        if (isOptimistic === void 0) { isOptimistic = false; }
-        var _a = this.getQueryParts(observableQuery), variables = _a.variables, document = _a.document;
-        var lastResult = observableQuery.getLastResult();
-        var readOptions = {
-            store: isOptimistic
-                ? this.getDataWithOptimisticResults()
-                : this.getApolloState().data,
-            query: document,
-            variables: variables,
-            config: this.reducerConfig,
-            previousResult: lastResult ? lastResult.data : undefined,
-            fragmentMatcherFunction: this.fragmentMatcher.match,
-        };
-        try {
-            var data = readQueryFromStore(readOptions);
-            return maybeDeepFreeze({ data: data, partial: false });
-        }
-        catch (e) {
-            return maybeDeepFreeze({ data: {}, partial: true });
-        }
-    };
-    QueryManager.prototype.getQueryWithPreviousResult = function (queryIdOrObservable, isOptimistic) {
-        if (isOptimistic === void 0) { isOptimistic = false; }
-        var observableQuery;
-        if (typeof queryIdOrObservable === 'string') {
-            if (!this.observableQueries[queryIdOrObservable]) {
-                throw new Error("ObservableQuery with this id doesn't exist: " + queryIdOrObservable);
-            }
-            observableQuery = this.observableQueries[queryIdOrObservable]
-                .observableQuery;
-        }
-        else {
-            observableQuery = queryIdOrObservable;
-        }
-        var _a = this.getQueryParts(observableQuery), variables = _a.variables, document = _a.document;
-        var data = this.getCurrentQueryResult(observableQuery, isOptimistic).data;
-        return {
-            previousResult: data,
-            variables: variables,
-            document: document,
-        };
-    };
-    QueryManager.prototype.getQueryParts = function (observableQuery) {
-        var queryOptions = observableQuery.options;
-        var transformedDoc = observableQuery.options.query;
-        if (this.addTypename) {
-            transformedDoc = addTypenameToDocument(transformedDoc);
-        }
-        return {
-            variables: queryOptions.variables,
-            document: transformedDoc,
-        };
-    };
-    QueryManager.prototype.transformQueryDocument = function (options) {
-        var queryDoc = options.query;
-        if (this.addTypename) {
-            queryDoc = addTypenameToDocument(queryDoc);
-        }
-        return {
-            queryDoc: queryDoc,
-        };
-    };
-    QueryManager.prototype.getExtraReducers = function () {
-        var _this = this;
-        return Object.keys(this.observableQueries)
-            .map(function (obsQueryId) {
-            var query = _this.observableQueries[obsQueryId].observableQuery;
-            var queryOptions = query.options;
-            if (queryOptions.reducer) {
-                return createStoreReducer(queryOptions.reducer, _this.addTypename
-                    ? addTypenameToDocument(queryOptions.query)
-                    : queryOptions.query, query.variables || {}, _this.reducerConfig);
-            }
-            return null;
-        })
-            .filter(function (reducer) { return reducer !== null; });
-    };
-    QueryManager.prototype.fetchRequest = function (_a) {
-        var _this = this;
-        var requestId = _a.requestId, queryId = _a.queryId, document = _a.document, options = _a.options, fetchMoreForQueryId = _a.fetchMoreForQueryId;
-        var variables = options.variables;
-        var request = {
-            query: document,
-            variables: variables,
-            operationName: getOperationName(document),
-        };
-        var retPromise = new Promise(function (resolve, reject) {
-            _this.addFetchQueryPromise(requestId, retPromise, resolve, reject);
-            _this.deduplicator
-                .query(request, _this.queryDeduplication)
-                .then(function (result) {
-                var extraReducers = _this.getExtraReducers();
-                if (requestId >= (_this.lastRequestId[queryId] || 1)) {
-                    _this.disableBroadcasting = true;
-                    _this.store.dispatch({
-                        type: 'APOLLO_QUERY_RESULT',
-                        document: document,
-                        variables: variables ? variables : {},
-                        operationName: getOperationName(document),
-                        result: result,
-                        queryId: queryId,
-                        requestId: requestId,
-                        fetchMoreForQueryId: fetchMoreForQueryId,
-                        extraReducers: extraReducers,
-                    });
-                    _this.disableBroadcasting = false;
-                    var reducerError = _this.getApolloState().reducerError;
-                    if (!reducerError || reducerError.queryId !== queryId) {
-                        _this.queryStore.markQueryResult(queryId, result, fetchMoreForQueryId);
-                        _this.broadcastQueries();
-                    }
-                }
-                _this.removeFetchQueryPromise(requestId);
-                if (result.errors) {
-                    throw new ApolloError({
-                        graphQLErrors: result.errors,
-                    });
-                }
-                return result;
-            })
-                .then(function (result) {
-                var resultFromStore;
-                if (fetchMoreForQueryId) {
-                    resultFromStore = result.data;
-                }
-                else {
-                    try {
-                        resultFromStore = readQueryFromStore({
-                            store: _this.getApolloState().data,
-                            variables: variables,
-                            query: document,
-                            config: _this.reducerConfig,
-                            fragmentMatcherFunction: _this.fragmentMatcher.match,
-                        });
-                    }
-                    catch (e) { }
-                }
-                var reducerError = _this.getApolloState().reducerError;
-                if (reducerError && reducerError.queryId === queryId) {
-                    return Promise.reject(reducerError.error);
-                }
-                _this.removeFetchQueryPromise(requestId);
-                resolve({
-                    data: resultFromStore,
-                    loading: false,
-                    networkStatus: exports.NetworkStatus.ready,
-                    stale: false,
-                });
-                return Promise.resolve();
-            })
-                .catch(function (error) {
-                reject(error);
-            });
-        });
-        return retPromise;
-    };
-    QueryManager.prototype.refetchQueryByName = function (queryName) {
-        var _this = this;
-        var refetchedQueries = this.queryIdsByName[queryName];
-        if (refetchedQueries === undefined) {
-            console.warn("Warning: unknown query with name " + queryName + " asked to refetch");
-            return;
-        }
-        else {
-            return Promise.all(refetchedQueries.map(function (queryId) {
-                return _this.observableQueries[queryId].observableQuery.refetch();
-            }));
-        }
-    };
-    QueryManager.prototype.broadcastQueries = function () {
-        var _this = this;
-        if (this.disableBroadcasting) {
-            return;
-        }
-        Object.keys(this.queryListeners).forEach(function (queryId) {
-            var listeners = _this.queryListeners[queryId];
-            if (listeners) {
-                listeners.forEach(function (listener) {
-                    if (listener) {
-                        var queryStoreValue = _this.queryStore.get(queryId);
-                        listener(queryStoreValue);
-                    }
-                });
-            }
-        });
-    };
-    QueryManager.prototype.generateRequestId = function () {
-        var requestId = this.idCounter;
-        this.idCounter++;
-        return requestId;
-    };
-    QueryManager.EMIT_REDUX_ACTIONS = true;
-    return QueryManager;
-}());
-
-var version = "1.9.3";
-
-var __assign$11 = (undefined && undefined.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-var DEFAULT_REDUX_ROOT_KEY = 'apollo';
-function defaultReduxRootSelector(state) {
-    return state[DEFAULT_REDUX_ROOT_KEY];
-}
-function defaultDataIdFromObject(result) {
-    if (result.__typename) {
-        if (result.id !== undefined) {
-            return result.__typename + ":" + result.id;
-        }
-        if (result._id !== undefined) {
-            return result.__typename + ":" + result._id;
-        }
-    }
-    return null;
-}
-var hasSuggestedDevtools = false;
-var ApolloClient$1 = (function () {
-    function ApolloClient(options) {
-        if (options === void 0) { options = {}; }
-        var _this = this;
-        this.middleware = function () {
-            return function (store) {
-                _this.setStore(store);
-                return function (next) { return function (action) {
-                    var previousApolloState = _this.queryManager.selectApolloState(store);
-                    var returnValue = next(action);
-                    var newApolloState = _this.queryManager.selectApolloState(store);
-                    if (newApolloState !== previousApolloState) {
-                        _this.queryManager.broadcastNewStore(store.getState());
-                    }
-                    if (_this.devToolsHookCb) {
-                        _this.devToolsHookCb({
-                            action: action,
-                            state: {
-                                queries: _this.queryManager.queryStore.getStore(),
-                                mutations: _this.queryManager.mutationStore.getStore(),
-                            },
-                            dataWithOptimisticResults: _this.queryManager.getDataWithOptimisticResults(),
-                        });
-                    }
-                    return returnValue;
-                }; };
-            };
-        };
-        var dataIdFromObject = options.dataIdFromObject;
-        var networkInterface = options.networkInterface, reduxRootSelector = options.reduxRootSelector, initialState = options.initialState, _a = options.ssrMode, ssrMode = _a === void 0 ? false : _a, _b = options.ssrForceFetchDelay, ssrForceFetchDelay = _b === void 0 ? 0 : _b, _c = options.addTypename, addTypename = _c === void 0 ? true : _c, customResolvers = options.customResolvers, connectToDevTools = options.connectToDevTools, fragmentMatcher = options.fragmentMatcher, _d = options.queryDeduplication, queryDeduplication = _d === void 0 ? true : _d;
-        if (typeof reduxRootSelector === 'function') {
-            this.reduxRootSelector = reduxRootSelector;
-        }
-        else if (typeof reduxRootSelector !== 'undefined') {
-            throw new Error('"reduxRootSelector" must be a function.');
-        }
-        if (typeof fragmentMatcher === 'undefined') {
-            this.fragmentMatcher = new HeuristicFragmentMatcher();
-        }
-        else {
-            this.fragmentMatcher = fragmentMatcher;
-        }
-        var createQuery = function (getResult) {
-            return function (request) {
-                return new Promise(function (resolve, reject) {
-                    var resolved = false;
-                    var subscription = getResult(request).subscribe({
-                        next: function (data) {
-                            if (!resolved) {
-                                resolve(data);
-                                resolved = true;
-                            }
-                            else {
-                                console.warn('Apollo Client does not support multiple results from an Observable');
-                            }
-                        },
-                        error: reject,
-                        complete: function () { return subscription.unsubscribe(); },
-                    });
-                });
-            };
-        };
-        if (networkInterface instanceof apolloLinkCore.ApolloLink) {
-            var count_1 = 0;
-            this.networkInterface = {
-                query: createQuery(function (request) {
-                    return apolloLinkCore.execute(networkInterface, request);
-                }),
-                subscribe: function (request, handler) {
-                    if (!_this.subscriptionMap) {
-                        _this.subscriptionMap = new Map();
-                    }
-                    var subscription = apolloLinkCore.execute(networkInterface, request).subscribe({
-                        next: function (data) { return handler(undefined, data); },
-                        error: function (error) { return handler([error]); },
-                        complete: handler,
-                    });
-                    var id = count_1.toString();
-                    _this.subscriptionMap.set(id, subscription);
-                    count_1++;
-                    return id;
-                },
-                unsubscribe: function (id) {
-                    if (_this.subscriptionMap) {
-                        var subscription = _this.subscriptionMap.get(id);
-                        if (subscription) {
-                            subscription.unsubscribe();
-                        }
-                    }
-                },
-            };
-        }
-        else {
-            this.networkInterface = networkInterface
-                ? networkInterface
-                : createNetworkInterface({ uri: '/graphql' });
-        }
-        this.initialState = initialState ? initialState : {};
-        this.addTypename = addTypename;
-        this.disableNetworkFetches = ssrMode || ssrForceFetchDelay > 0;
-        this.dataId = dataIdFromObject =
-            dataIdFromObject || defaultDataIdFromObject;
-        this.dataIdFromObject = this.dataId;
-        this.fieldWithArgs = getStoreKeyName;
-        this.queryDeduplication = queryDeduplication;
-        this.ssrMode = ssrMode;
-        if (ssrForceFetchDelay) {
-            setTimeout(function () { return (_this.disableNetworkFetches = false); }, ssrForceFetchDelay);
-        }
-        this.reducerConfig = {
-            dataIdFromObject: dataIdFromObject,
-            customResolvers: customResolvers,
-            addTypename: addTypename,
-            fragmentMatcher: this.fragmentMatcher.match,
-        };
-        this.watchQuery = this.watchQuery.bind(this);
-        this.query = this.query.bind(this);
-        this.mutate = this.mutate.bind(this);
-        this.setStore = this.setStore.bind(this);
-        this.resetStore = this.resetStore.bind(this);
-        var defaultConnectToDevTools = !isProduction() &&
-            typeof window !== 'undefined' &&
-            !window.__APOLLO_CLIENT__;
-        if (typeof connectToDevTools === 'undefined'
-            ? defaultConnectToDevTools
-            : connectToDevTools) {
-            window.__APOLLO_CLIENT__ = this;
-        }
-        if (!hasSuggestedDevtools && !isProduction()) {
-            hasSuggestedDevtools = true;
-            if (typeof window !== 'undefined' &&
-                window.document &&
-                window.top === window.self) {
-                if (typeof window.__APOLLO_DEVTOOLS_GLOBAL_HOOK__ === 'undefined') {
-                    if (navigator.userAgent.indexOf('Chrome') > -1) {
-                        console.debug('Download the Apollo DevTools ' +
-                            'for a better development experience: ' +
-                            'https://chrome.google.com/webstore/detail/apollo-client-developer-t/jdkknkkbebbapilgoeccciglkfbmbnfm');
-                    }
-                }
-            }
-        }
-        this.version = version;
-    }
-    ApolloClient.prototype.watchQuery = function (options) {
-        this.initStore();
-        if (this.disableNetworkFetches && options.fetchPolicy === 'network-only') {
-            options = __assign$11({}, options, { fetchPolicy: 'cache-first' });
-        }
-        return this.queryManager.watchQuery(options);
-    };
-    ApolloClient.prototype.query = function (options) {
-        this.initStore();
-        if (options.fetchPolicy === 'cache-and-network') {
-            throw new Error('cache-and-network fetchPolicy can only be used with watchQuery');
-        }
-        if (this.disableNetworkFetches && options.fetchPolicy === 'network-only') {
-            options = __assign$11({}, options, { fetchPolicy: 'cache-first' });
-        }
-        return this.queryManager.query(options);
-    };
-    ApolloClient.prototype.mutate = function (options) {
-        this.initStore();
-        return this.queryManager.mutate(options);
-    };
-    ApolloClient.prototype.subscribe = function (options) {
-        this.initStore();
-        return this.queryManager.startGraphQLSubscription(options);
-    };
-    ApolloClient.prototype.readQuery = function (options) {
-        return this.initProxy().readQuery(options);
-    };
-    ApolloClient.prototype.readFragment = function (options) {
-        return this.initProxy().readFragment(options);
-    };
-    ApolloClient.prototype.writeQuery = function (options) {
-        return this.initProxy().writeQuery(options);
-    };
-    ApolloClient.prototype.writeFragment = function (options) {
-        return this.initProxy().writeFragment(options);
-    };
-    ApolloClient.prototype.reducer = function () {
-        return createApolloReducer(this.reducerConfig);
-    };
-    ApolloClient.prototype.__actionHookForDevTools = function (cb) {
-        this.devToolsHookCb = cb;
-    };
-    ApolloClient.prototype.initStore = function () {
-        var _this = this;
-        if (this.store) {
-            return;
-        }
-        if (this.reduxRootSelector) {
-            throw new Error('Cannot initialize the store because "reduxRootSelector" is provided. ' +
-                'reduxRootSelector should only be used when the store is created outside of the client. ' +
-                'This may lead to unexpected results when querying the store internally. ' +
-                "Please remove that option from ApolloClient constructor.");
-        }
-        this.setStore(createApolloStore({
-            reduxRootKey: DEFAULT_REDUX_ROOT_KEY,
-            initialState: this.initialState,
-            config: this.reducerConfig,
-            logger: function (store) { return function (next) { return function (action) {
-                var result = next(action);
-                if (_this.devToolsHookCb) {
-                    _this.devToolsHookCb({
-                        action: action,
-                        state: {
-                            queries: _this.queryManager.queryStore.getStore(),
-                            mutations: _this.queryManager.mutationStore.getStore(),
-                        },
-                        dataWithOptimisticResults: _this.queryManager.getDataWithOptimisticResults(),
-                    });
-                }
-                return result;
-            }; }; },
-        }));
-    };
-    ApolloClient.prototype.resetStore = function () {
-        return this.queryManager ? this.queryManager.resetStore() : null;
-    };
-    ApolloClient.prototype.getInitialState = function () {
-        this.initStore();
-        return this.queryManager.getInitialState();
-    };
-    ApolloClient.prototype.setStore = function (store) {
-        var reduxRootSelector;
-        if (this.reduxRootSelector) {
-            reduxRootSelector = this.reduxRootSelector;
-        }
-        else {
-            reduxRootSelector = defaultReduxRootSelector;
-        }
-        if (typeof reduxRootSelector(store.getState()) === 'undefined') {
-            throw new Error('Existing store does not use apolloReducer. Please make sure the store ' +
-                'is properly configured and "reduxRootSelector" is correctly specified.');
-        }
-        this.store = store;
-        this.queryManager = new QueryManager({
-            networkInterface: this.networkInterface,
-            reduxRootSelector: reduxRootSelector,
-            store: store,
-            addTypename: this.addTypename,
-            reducerConfig: this.reducerConfig,
-            queryDeduplication: this.queryDeduplication,
-            fragmentMatcher: this.fragmentMatcher,
-            ssrMode: this.ssrMode,
-        });
-    };
-    ApolloClient.prototype.initProxy = function () {
-        if (!this.proxy) {
-            this.initStore();
-            this.proxy = new ReduxDataProxy(this.store, this.reduxRootSelector || defaultReduxRootSelector, this.fragmentMatcher, this.reducerConfig);
-        }
-        return this.proxy;
-    };
-    return ApolloClient;
-}());
-
-exports.createNetworkInterface = createNetworkInterface;
-exports.createBatchingNetworkInterface = createBatchingNetworkInterface;
-exports.createApolloStore = createApolloStore;
-exports.createApolloReducer = createApolloReducer;
-exports.readQueryFromStore = readQueryFromStore;
-exports.writeQueryToStore = writeQueryToStore;
-exports.addTypenameToDocument = addTypenameToDocument;
-exports.createFragmentMap = createFragmentMap;
-exports.ApolloError = ApolloError;
-exports.getQueryDefinition = getQueryDefinition;
+exports.getDirectiveInfoFromField = getDirectiveInfoFromField;
+exports.shouldInclude = shouldInclude;
+exports.flattenSelections = flattenSelections;
+exports.getDirectiveNames = getDirectiveNames;
+exports.hasDirectives = hasDirectives;
+exports.getFragmentQueryDocument = getFragmentQueryDocument;
 exports.getMutationDefinition = getMutationDefinition;
+exports.checkDocument = checkDocument;
+exports.getOperationDefinition = getOperationDefinition;
+exports.getOperationDefinitionOrDie = getOperationDefinitionOrDie;
+exports.getOperationName = getOperationName;
 exports.getFragmentDefinitions = getFragmentDefinitions;
+exports.getQueryDefinition = getQueryDefinition;
+exports.getFragmentDefinition = getFragmentDefinition;
+exports.getMainDefinition = getMainDefinition;
+exports.createFragmentMap = createFragmentMap;
+exports.getDefaultValues = getDefaultValues;
+exports.variablesInOperation = variablesInOperation;
+exports.removeDirectivesFromDocument = removeDirectivesFromDocument;
+exports.addTypenameToDocument = addTypenameToDocument;
+exports.removeConnectionDirectiveFromDocument = removeConnectionDirectiveFromDocument;
+exports.isScalarValue = isScalarValue;
+exports.isNumberValue = isNumberValue;
+exports.valueToObjectRepresentation = valueToObjectRepresentation;
+exports.storeKeyNameFromField = storeKeyNameFromField;
+exports.getStoreKeyName = getStoreKeyName;
+exports.argumentsObjectFromField = argumentsObjectFromField;
+exports.resultKeyNameFromField = resultKeyNameFromField;
+exports.isField = isField;
+exports.isInlineFragment = isInlineFragment;
+exports.isIdValue = isIdValue;
 exports.toIdValue = toIdValue;
-exports.IntrospectionFragmentMatcher = IntrospectionFragmentMatcher;
-exports.printAST = printer.print;
-exports.HTTPFetchNetworkInterface = HTTPFetchNetworkInterface;
-exports.HTTPBatchedNetworkInterface = HTTPBatchedNetworkInterface;
-exports.ObservableQuery = ObservableQuery;
-exports.ApolloClient = ApolloClient$1;
-exports['default'] = ApolloClient$1;
+exports.isJsonValue = isJsonValue;
+exports.valueFromNode = valueFromNode;
+exports.assign = assign;
+exports.cloneDeep = cloneDeep;
+exports.getEnv = getEnv;
+exports.isEnv = isEnv;
+exports.isProduction = isProduction;
+exports.isDevelopment = isDevelopment;
+exports.isTest = isTest;
+exports.tryFunctionOrLogError = tryFunctionOrLogError;
+exports.graphQLResultHasError = graphQLResultHasError;
+exports.isEqual = isEqual;
+exports.maybeDeepFreeze = maybeDeepFreeze;
+exports.warnOnceInDevelopment = warnOnceInDevelopment;
 
 Object.defineProperty(exports, '__esModule', { value: true });
 
@@ -3915,369 +3912,18 @@ Object.defineProperty(exports, '__esModule', { value: true });
 
 
 }).call(this,require('_process'))
-},{"_process":36,"apollo-link-core":3,"graphql-anywhere":9,"graphql/language/printer":23,"redux":42,"symbol-observable":44,"whatwg-fetch":47}],3:[function(require,module,exports){
-"use strict";
-function __export(m) {
-    for (var p in m) if (!exports.hasOwnProperty(p)) exports[p] = m[p];
-}
-Object.defineProperty(exports, "__esModule", { value: true });
-var link_1 = require("./link");
-exports.execute = link_1.execute;
-exports.ApolloLink = link_1.ApolloLink;
-var linkUtils_1 = require("./linkUtils");
-exports.makePromise = linkUtils_1.makePromise;
-var zen_observable_ts_1 = require("zen-observable-ts");
-exports.Observable = zen_observable_ts_1.default;
-__export(require("zen-observable-ts"));
-exports.default = link_1.ApolloLink;
+},{"_process":24}],9:[function(require,module,exports){
+(function (global, factory) {
+	typeof exports === 'object' && typeof module !== 'undefined' ? factory(exports, require('apollo-utilities')) :
+	typeof define === 'function' && define.amd ? define(['exports', 'apollo-utilities'], factory) :
+	(factory((global.graphqlAnywhere = {}),global.apollo.utilities));
+}(this, (function (exports,apolloUtilities) { 'use strict';
 
-},{"./link":4,"./linkUtils":5,"zen-observable-ts":48}],4:[function(require,module,exports){
-"use strict";
-var __extends = (this && this.__extends) || (function () {
-    var extendStatics = Object.setPrototypeOf ||
-        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
-    return function (d, b) {
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-var __assign = (this && this.__assign) || Object.assign || function(t) {
-    for (var s, i = 1, n = arguments.length; i < n; i++) {
-        s = arguments[i];
-        for (var p in s) if (Object.prototype.hasOwnProperty.call(s, p))
-            t[p] = s[p];
-    }
-    return t;
-};
-Object.defineProperty(exports, "__esModule", { value: true });
-var linkUtils_1 = require("./linkUtils");
-var graphql_tag_1 = require("graphql-tag");
-var zen_observable_ts_1 = require("zen-observable-ts");
-var ApolloLink = (function () {
-    function ApolloLink() {
-    }
-    ApolloLink.from = function (links) {
-        if (links.length === 0) {
-            return ApolloLink.empty();
-        }
-        return links.map(linkUtils_1.toLink).reduce(function (x, y) { return x.concat(y); });
-    };
-    ApolloLink.empty = function () {
-        return new FunctionLink(function (op, forward) { return zen_observable_ts_1.default.of(); });
-    };
-    ApolloLink.passthrough = function () {
-        return new FunctionLink(function (op, forward) { return (forward ? forward(op) : zen_observable_ts_1.default.of()); });
-    };
-    ApolloLink.split = function (test, left, right) {
-        if (right === void 0) { right = ApolloLink.passthrough(); }
-        var leftLink = linkUtils_1.validateLink(linkUtils_1.toLink(left));
-        var rightLink = linkUtils_1.validateLink(linkUtils_1.toLink(right));
-        if (linkUtils_1.isTerminating(leftLink) && linkUtils_1.isTerminating(rightLink)) {
-            return new FunctionLink(function (operation) {
-                return test(operation)
-                    ? leftLink.request(operation) || zen_observable_ts_1.default.of()
-                    : rightLink.request(operation) || zen_observable_ts_1.default.of();
-            });
-        }
-        else {
-            return new FunctionLink(function (operation, forward) {
-                return test(operation)
-                    ? leftLink.request(operation, forward) || zen_observable_ts_1.default.of()
-                    : rightLink.request(operation, forward) || zen_observable_ts_1.default.of();
-            });
-        }
-    };
-    ApolloLink.prototype.split = function (test, left, right) {
-        if (right === void 0) { right = ApolloLink.passthrough(); }
-        return this.concat(ApolloLink.split(test, left, right));
-    };
-    ApolloLink.prototype.concat = function (next) {
-        var _this = this;
-        linkUtils_1.validateLink(this);
-        if (linkUtils_1.isTerminating(this)) {
-            console.warn(new linkUtils_1.LinkError("You are calling concat on a terminating link, which will have no effect", this));
-            return this;
-        }
-        var nextLink = linkUtils_1.validateLink(linkUtils_1.toLink(next));
-        if (linkUtils_1.isTerminating(nextLink)) {
-            return new FunctionLink(function (operation) {
-                return _this.request(operation, function (op) { return nextLink.request(op) || zen_observable_ts_1.default.of(); }) || zen_observable_ts_1.default.of();
-            });
-        }
-        else {
-            return new FunctionLink(function (operation, forward) {
-                return (_this.request(operation, function (op) {
-                    return nextLink.request(op, forward) || zen_observable_ts_1.default.of();
-                }) || zen_observable_ts_1.default.of());
-            });
-        }
-    };
-    return ApolloLink;
-}());
-exports.ApolloLink = ApolloLink;
-function execute(link, operation) {
-    var copy = __assign({}, operation);
-    linkUtils_1.validateOperation(copy);
-    if (!copy.context) {
-        copy.context = {};
-    }
-    if (!copy.variables) {
-        copy.variables = {};
-    }
-    if (!copy.query) {
-        console.warn("query should either be a string or GraphQL AST");
-        copy.query = {};
-    }
-    return link.request(transformOperation(copy)) || zen_observable_ts_1.default.of();
-}
-exports.execute = execute;
-function getName(node) {
-    return node && node.name && node.name.kind === 'Name' && node.name.value;
-}
-function transformOperation(operation) {
-    var transformedOperation;
-    if (typeof operation.query === 'string') {
-        transformedOperation = __assign({}, operation, { query: graphql_tag_1.default(operation.query) });
-    }
-    else {
-        transformedOperation = __assign({}, operation);
-    }
-    if (transformedOperation.query && transformedOperation.query.definitions) {
-        if (!transformedOperation.operationName) {
-            var operationTypes_1 = ['query', 'mutation', 'subscription'];
-            var definitions = transformedOperation.query.definitions.filter(function (x) {
-                return x.kind === 'OperationDefinition' &&
-                    operationTypes_1.indexOf(x.operation) >= 0;
-            });
-            transformedOperation.operationName = getName(definitions[0]) || '';
-        }
-    }
-    else if (!transformedOperation.operationName) {
-        transformedOperation.operationName = '';
-    }
-    return transformedOperation;
-}
-var FunctionLink = (function (_super) {
-    __extends(FunctionLink, _super);
-    function FunctionLink(f) {
-        var _this = _super.call(this) || this;
-        _this.f = f;
-        _this.request = f;
-        return _this;
-    }
-    FunctionLink.prototype.request = function (operation, forward) {
-        throw Error('should be overridden');
-    };
-    return FunctionLink;
-}(ApolloLink));
-exports.FunctionLink = FunctionLink;
-
-},{"./linkUtils":5,"graphql-tag":12,"zen-observable-ts":48}],5:[function(require,module,exports){
-"use strict";
-var __extends = (this && this.__extends) || (function () {
-    var extendStatics = Object.setPrototypeOf ||
-        ({ __proto__: [] } instanceof Array && function (d, b) { d.__proto__ = b; }) ||
-        function (d, b) { for (var p in b) if (b.hasOwnProperty(p)) d[p] = b[p]; };
-    return function (d, b) {
-        extendStatics(d, b);
-        function __() { this.constructor = d; }
-        d.prototype = b === null ? Object.create(b) : (__.prototype = b.prototype, new __());
-    };
-})();
-Object.defineProperty(exports, "__esModule", { value: true });
-var link_1 = require("./link");
-function validateLink(link) {
-    if (link instanceof link_1.ApolloLink && typeof link.request === 'function') {
-        return link;
-    }
-    else {
-        throw new LinkError('Link does not extend ApolloLink and implement request', link);
-    }
-}
-exports.validateLink = validateLink;
-function validateOperation(operation) {
-    var OPERATION_FIELDS = ['query', 'operationName', 'variables', 'context'];
-    for (var _i = 0, _a = Object.keys(operation); _i < _a.length; _i++) {
-        var key = _a[_i];
-        if (OPERATION_FIELDS.indexOf(key) < 0) {
-            throw new Error("illegal argument: " + key);
-        }
-    }
-    return operation;
-}
-exports.validateOperation = validateOperation;
-var LinkError = (function (_super) {
-    __extends(LinkError, _super);
-    function LinkError(message, link) {
-        var _this = _super.call(this, message) || this;
-        _this.link = link;
-        return _this;
-    }
-    return LinkError;
-}(Error));
-exports.LinkError = LinkError;
-function toLink(link) {
-    if (typeof link === 'function') {
-        return new link_1.FunctionLink(link);
-    }
-    else {
-        return link;
-    }
-}
-exports.toLink = toLink;
-function isTerminating(link) {
-    return link.request.length <= 1;
-}
-exports.isTerminating = isTerminating;
-function makePromise(observable) {
-    var completed = false;
-    return new Promise(function (resolve, reject) {
-        observable.subscribe({
-            next: function (data) {
-                if (completed) {
-                    console.warn("Promise Wrapper does not support multiple results from Observable");
-                }
-                else {
-                    completed = true;
-                    resolve(data);
-                }
-            },
-            error: reject,
-        });
-    });
-}
-exports.makePromise = makePromise;
-
-},{"./link":4}],6:[function(require,module,exports){
-"use strict";
-var storeUtils_1 = require("./storeUtils");
-function getDirectiveInfoFromField(field, variables) {
-    if (field.directives && field.directives.length) {
-        var directiveObj_1 = {};
-        field.directives.forEach(function (directive) {
-            directiveObj_1[directive.name.value] = storeUtils_1.argumentsObjectFromField(directive, variables);
-        });
-        return directiveObj_1;
-    }
-    return null;
-}
-exports.getDirectiveInfoFromField = getDirectiveInfoFromField;
-function shouldInclude(selection, variables) {
-    if (variables === void 0) { variables = {}; }
-    if (!selection.directives) {
-        return true;
-    }
-    var res = true;
-    selection.directives.some(function (directive) {
-        if (directive.name.value !== 'skip' && directive.name.value !== 'include') {
-            return;
-        }
-        var directiveArguments = directive.arguments;
-        var directiveName = directive.name.value;
-        if (directiveArguments.length !== 1) {
-            throw new Error("Incorrect number of arguments for the @" + directiveName + " directive.");
-        }
-        var ifArgument = directive.arguments[0];
-        if (!ifArgument.name || ifArgument.name.value !== 'if') {
-            throw new Error("Invalid argument for the @" + directiveName + " directive.");
-        }
-        var ifValue = directive.arguments[0].value;
-        var evaledValue = false;
-        if (!ifValue || ifValue.kind !== 'BooleanValue') {
-            if (ifValue.kind !== 'Variable') {
-                throw new Error("Argument for the @" + directiveName + " directive must be a variable or a bool ean value.");
-            }
-            else {
-                evaledValue = variables[ifValue.name.value];
-                if (evaledValue === undefined) {
-                    throw new Error("Invalid variable referenced in @" + directiveName + " directive.");
-                }
-            }
-        }
-        else {
-            evaledValue = ifValue.value;
-        }
-        if (directiveName === 'skip') {
-            evaledValue = !evaledValue;
-        }
-        if (!evaledValue) {
-            res = false;
-            return true;
-        }
-        return false;
-    });
-    return res;
-}
-exports.shouldInclude = shouldInclude;
-
-},{"./storeUtils":10}],7:[function(require,module,exports){
-"use strict";
-function checkDocument(doc) {
-    if (doc.kind !== 'Document') {
-        throw new Error("Expecting a parsed GraphQL document. Perhaps you need to wrap the query string in a \"gql\" tag? http://docs.apollostack.com/apollo-client/core.html#gql");
-    }
-    var numOpDefinitions = doc.definitions.filter(function (definition) {
-        return definition.kind === 'OperationDefinition';
-    }).length;
-    if (numOpDefinitions > 1) {
-        throw new Error('Queries must have exactly one operation definition.');
-    }
-}
-function getFragmentDefinitions(doc) {
-    var fragmentDefinitions = doc.definitions.filter(function (definition) {
-        if (definition.kind === 'FragmentDefinition') {
-            return true;
-        }
-        else {
-            return false;
-        }
-    });
-    return fragmentDefinitions;
-}
-exports.getFragmentDefinitions = getFragmentDefinitions;
-function createFragmentMap(fragments) {
-    if (fragments === void 0) { fragments = []; }
-    var symTable = {};
-    fragments.forEach(function (fragment) {
-        symTable[fragment.name.value] = fragment;
-    });
-    return symTable;
-}
-exports.createFragmentMap = createFragmentMap;
-function getMainDefinition(queryDoc) {
-    checkDocument(queryDoc);
-    var fragmentDefinition;
-    for (var _i = 0, _a = queryDoc.definitions; _i < _a.length; _i++) {
-        var definition = _a[_i];
-        if (definition.kind === 'OperationDefinition') {
-            var operation = definition.operation;
-            if (operation === 'query' || operation === 'mutation' || operation === 'subscription') {
-                return definition;
-            }
-        }
-        if (definition.kind === 'FragmentDefinition' && !fragmentDefinition) {
-            fragmentDefinition = definition;
-        }
-    }
-    if (fragmentDefinition) {
-        return fragmentDefinition;
-    }
-    throw new Error('Expected a parsed GraphQL query with a query, mutation, subscription, or a fragment.');
-}
-exports.getMainDefinition = getMainDefinition;
-
-},{}],8:[function(require,module,exports){
-"use strict";
-var getFromAST_1 = require("./getFromAST");
-var directives_1 = require("./directives");
-var storeUtils_1 = require("./storeUtils");
-function graphql(resolver, document, rootValue, contextValue, variableValues, execOptions) {
+function graphql$1(resolver, document, rootValue, contextValue, variableValues, execOptions) {
     if (execOptions === void 0) { execOptions = {}; }
-    var mainDefinition = getFromAST_1.getMainDefinition(document);
-    var fragments = getFromAST_1.getFragmentDefinitions(document);
-    var fragmentMap = getFromAST_1.createFragmentMap(fragments);
+    var mainDefinition = apolloUtilities.getMainDefinition(document);
+    var fragments = apolloUtilities.getFragmentDefinitions(document);
+    var fragmentMap = apolloUtilities.createFragmentMap(fragments);
     var resultMapper = execOptions.resultMapper;
     var fragmentMatcher = execOptions.fragmentMatcher || (function () { return true; });
     var execContext = {
@@ -4290,17 +3936,16 @@ function graphql(resolver, document, rootValue, contextValue, variableValues, ex
     };
     return executeSelectionSet(mainDefinition.selectionSet, rootValue, execContext);
 }
-exports.graphql = graphql;
 function executeSelectionSet(selectionSet, rootValue, execContext) {
     var fragmentMap = execContext.fragmentMap, contextValue = execContext.contextValue, variables = execContext.variableValues;
     var result = {};
     selectionSet.selections.forEach(function (selection) {
-        if (!directives_1.shouldInclude(selection, variables)) {
+        if (!apolloUtilities.shouldInclude(selection, variables)) {
             return;
         }
-        if (storeUtils_1.isField(selection)) {
+        if (apolloUtilities.isField(selection)) {
             var fieldResult = executeField(selection, rootValue, execContext);
-            var resultFieldKey = storeUtils_1.resultKeyNameFromField(selection);
+            var resultFieldKey = apolloUtilities.resultKeyNameFromField(selection);
             if (fieldResult !== undefined) {
                 if (result[resultFieldKey] === undefined) {
                     result[resultFieldKey] = fieldResult;
@@ -4312,7 +3957,7 @@ function executeSelectionSet(selectionSet, rootValue, execContext) {
         }
         else {
             var fragment = void 0;
-            if (storeUtils_1.isInlineFragment(selection)) {
+            if (apolloUtilities.isInlineFragment(selection)) {
                 fragment = selection;
             }
             else {
@@ -4336,11 +3981,11 @@ function executeSelectionSet(selectionSet, rootValue, execContext) {
 function executeField(field, rootValue, execContext) {
     var variables = execContext.variableValues, contextValue = execContext.contextValue, resolver = execContext.resolver;
     var fieldName = field.name.value;
-    var args = storeUtils_1.argumentsObjectFromField(field, variables);
+    var args = apolloUtilities.argumentsObjectFromField(field, variables);
     var info = {
         isLeaf: !field.selectionSet,
-        resultKey: storeUtils_1.resultKeyNameFromField(field),
-        directives: directives_1.getDirectiveInfoFromField(field, variables),
+        resultKey: apolloUtilities.resultKeyNameFromField(field),
+        directives: apolloUtilities.getDirectiveInfoFromField(field, variables),
     };
     var result = resolver(fieldName, rootValue, args, contextValue, info);
     if (!field.selectionSet) {
@@ -4366,8 +4011,7 @@ function executeSubSelectedArray(field, result, execContext) {
     });
 }
 function merge(dest, src) {
-    if (src === null ||
-        typeof src !== 'object') {
+    if (src === null || typeof src !== 'object') {
         return src;
     }
     Object.keys(dest).forEach(function (destKey) {
@@ -4382,111 +4026,12 @@ function merge(dest, src) {
     });
 }
 
-},{"./directives":6,"./getFromAST":7,"./storeUtils":10}],9:[function(require,module,exports){
-"use strict";
-var utilities_1 = require("./utilities");
-exports.filter = utilities_1.filter;
-exports.check = utilities_1.check;
-exports.propType = utilities_1.propType;
-var graphql_1 = require("./graphql");
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.default = graphql_1.graphql;
-
-},{"./graphql":8,"./utilities":11}],10:[function(require,module,exports){
-"use strict";
-var SCALAR_TYPES = {
-    StringValue: true,
-    BooleanValue: true,
-    EnumValue: true,
-};
-function isScalarValue(value) {
-    return !!SCALAR_TYPES[value.kind];
-}
-var NUMBER_TYPES = {
-    IntValue: true,
-    FloatValue: true,
-};
-function isNumberValue(value) {
-    return NUMBER_TYPES[value.kind];
-}
-function isVariable(value) {
-    return value.kind === 'Variable';
-}
-function isObject(value) {
-    return value.kind === 'ObjectValue';
-}
-function isList(value) {
-    return value.kind === 'ListValue';
-}
-function valueToObjectRepresentation(argObj, name, value, variables) {
-    if (variables === void 0) { variables = {}; }
-    if (isNumberValue(value)) {
-        argObj[name.value] = Number(value.value);
-    }
-    else if (isScalarValue(value)) {
-        argObj[name.value] = value.value;
-    }
-    else if (isObject(value)) {
-        var nestedArgObj_1 = {};
-        value.fields.map(function (obj) { return valueToObjectRepresentation(nestedArgObj_1, obj.name, obj.value, variables); });
-        argObj[name.value] = nestedArgObj_1;
-    }
-    else if (isVariable(value)) {
-        var variableValue = variables[value.name.value];
-        argObj[name.value] = variableValue;
-    }
-    else if (isList(value)) {
-        argObj[name.value] = value.values.map(function (listValue) {
-            var nestedArgArrayObj = {};
-            valueToObjectRepresentation(nestedArgArrayObj, name, listValue, variables);
-            return nestedArgArrayObj[name.value];
-        });
-    }
-    else {
-        throw new Error("The inline argument \"" + name.value + "\" of kind \"" + value.kind + "\" is not supported. Use variables instead of inline arguments to overcome this limitation.");
-    }
-}
-function argumentsObjectFromField(field, variables) {
-    if (field.arguments && field.arguments.length) {
-        var argObj_1 = {};
-        field.arguments.forEach(function (_a) {
-            var name = _a.name, value = _a.value;
-            return valueToObjectRepresentation(argObj_1, name, value, variables);
-        });
-        return argObj_1;
-    }
-    return null;
-}
-exports.argumentsObjectFromField = argumentsObjectFromField;
-function resultKeyNameFromField(field) {
-    return field.alias ?
-        field.alias.value :
-        field.name.value;
-}
-exports.resultKeyNameFromField = resultKeyNameFromField;
-function isField(selection) {
-    return selection.kind === 'Field';
-}
-exports.isField = isField;
-function isInlineFragment(selection) {
-    return selection.kind === 'InlineFragment';
-}
-exports.isInlineFragment = isInlineFragment;
-function graphQLResultHasError(result) {
-    return result.errors && result.errors.length;
-}
-exports.graphQLResultHasError = graphQLResultHasError;
-
-},{}],11:[function(require,module,exports){
-"use strict";
-var graphql_1 = require("./graphql");
 function filter(doc, data) {
     var resolver = function (fieldName, root, args, context, info) {
         return root[info.resultKey];
     };
-    return graphql_1.graphql(resolver, doc, data);
+    return graphql$1(resolver, doc, data);
 }
-exports.filter = filter;
 function check(doc, data) {
     var resolver = function (fieldName, root, args, context, info) {
         if (!{}.hasOwnProperty.call(root, info.resultKey)) {
@@ -4494,11 +4039,10 @@ function check(doc, data) {
         }
         return root[info.resultKey];
     };
-    graphql_1.graphql(resolver, doc, data, {}, {}, {
+    graphql$1(resolver, doc, data, {}, {}, {
         fragmentMatcher: function () { return false; },
     });
 }
-exports.check = check;
 var ANONYMOUS = '<<anonymous>>';
 function PropTypeError(message) {
     this.message = message;
@@ -4546,9 +4090,18 @@ function propType(doc) {
         }
     });
 }
+
+exports['default'] = graphql$1;
+exports.filter = filter;
+exports.check = check;
 exports.propType = propType;
 
-},{"./graphql":8}],12:[function(require,module,exports){
+Object.defineProperty(exports, '__esModule', { value: true });
+
+})));
+
+
+},{"apollo-utilities":8}],10:[function(require,module,exports){
 (function (global, factory) {
 	typeof exports === 'object' && typeof module !== 'undefined' ? factory() :
 	typeof define === 'function' && define.amd ? define(factory) :
@@ -4728,7 +4281,7 @@ module.exports = gql;
 })));
 
 
-},{"graphql/language/parser":22}],13:[function(require,module,exports){
+},{"graphql/language/parser":20}],11:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -4830,21 +4383,20 @@ message, nodes, source, positions, path, originalError) {
       configurable: true
     });
   }
-}
-/**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
- *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
- */
+} /**
+   * Copyright (c) 2015-present, Facebook, Inc.
+   *
+   * This source code is licensed under the MIT license found in the
+   * LICENSE file in the root directory of this source tree.
+   *
+   * 
+   */
 
 GraphQLError.prototype = Object.create(Error.prototype, {
   constructor: { value: GraphQLError },
   name: { value: 'GraphQLError' }
 });
-},{"../language/location":21}],14:[function(require,module,exports){
+},{"../language/location":19}],12:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -4869,16 +4421,15 @@ function formatError(error) {
     locations: error.locations,
     path: error.path
   };
-}
-/**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
- *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
- */
-},{"../jsutils/invariant":18}],15:[function(require,module,exports){
+} /**
+   * Copyright (c) 2015-present, Facebook, Inc.
+   *
+   * This source code is licensed under the MIT license found in the
+   * LICENSE file in the root directory of this source tree.
+   *
+   * 
+   */
+},{"../jsutils/invariant":16}],13:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -4920,7 +4471,7 @@ Object.defineProperty(exports, 'formatError', {
     return _formatError.formatError;
   }
 });
-},{"./GraphQLError":13,"./formatError":14,"./locatedError":16,"./syntaxError":17}],16:[function(require,module,exports){
+},{"./GraphQLError":11,"./formatError":12,"./locatedError":14,"./syntaxError":15}],14:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -4944,16 +4495,15 @@ function locatedError(originalError, nodes, path) {
 
   var message = originalError ? originalError.message || String(originalError) : 'An unknown error occurred.';
   return new _GraphQLError.GraphQLError(message, originalError && originalError.nodes || nodes, originalError && originalError.source, originalError && originalError.positions, path, originalError);
-}
-/**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
- *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
- */
-},{"./GraphQLError":13}],17:[function(require,module,exports){
+} /**
+   * Copyright (c) 2015-present, Facebook, Inc.
+   *
+   * This source code is licensed under the MIT license found in the
+   * LICENSE file in the root directory of this source tree.
+   *
+   * 
+   */
+},{"./GraphQLError":11}],15:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -4969,14 +4519,13 @@ var _GraphQLError = require('./GraphQLError');
  * Produces a GraphQLError representing a syntax error, containing useful
  * descriptive information about the syntax error's position in the source.
  */
-
 /**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
+ * Copyright (c) 2015-present, Facebook, Inc.
  *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * 
  */
 
 function syntaxError(source, position, description) {
@@ -5017,21 +4566,20 @@ function whitespace(len) {
 function lpad(len, str) {
   return whitespace(len - str.length) + str;
 }
-},{"../language/location":21,"./GraphQLError":13}],18:[function(require,module,exports){
+},{"../language/location":19,"./GraphQLError":11}],16:[function(require,module,exports){
 "use strict";
 
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
 exports.default = invariant;
-
 /**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
+ * Copyright (c) 2015-present, Facebook, Inc.
  *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * 
  */
 
 function invariant(condition, message) {
@@ -5039,20 +4587,19 @@ function invariant(condition, message) {
     throw new Error(message);
   }
 }
-},{}],19:[function(require,module,exports){
+},{}],17:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
   value: true
 });
-
 /**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
+ * Copyright (c) 2015-present, Facebook, Inc.
  *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * 
  */
 
 // Name
@@ -5121,7 +4668,7 @@ var TYPE_EXTENSION_DEFINITION = exports.TYPE_EXTENSION_DEFINITION = 'TypeExtensi
 // Directive Definitions
 
 var DIRECTIVE_DEFINITION = exports.DIRECTIVE_DEFINITION = 'DirectiveDefinition';
-},{}],20:[function(require,module,exports){
+},{}],18:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -5153,14 +4700,13 @@ function createLexer(source, options) {
     advance: advanceLexer
   };
   return lexer;
-} /*  /
-  /**
-   *  Copyright (c) 2015, Facebook, Inc.
-   *  All rights reserved.
+} /**
+   * Copyright (c) 2015-present, Facebook, Inc.
    *
-   *  This source code is licensed under the BSD-style license found in the
-   *  LICENSE file in the root directory of this source tree. An additional grant
-   *  of patent rights can be found in the PATENTS file in the same directory.
+   * This source code is licensed under the MIT license found in the
+   * LICENSE file in the root directory of this source tree.
+   *
+   * 
    */
 
 function advanceLexer() {
@@ -5624,7 +5170,7 @@ function readName(source, position, line, col, prev) {
   }
   return new Tok(NAME, position, end, line, col, prev, slice.call(body, position, end));
 }
-},{"../error":15}],21:[function(require,module,exports){
+},{"../error":13}],19:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -5637,14 +5183,13 @@ exports.getLocation = getLocation;
  * Takes a Source and a UTF-8 character offset, and returns the corresponding
  * line and column as a SourceLocation.
  */
-
 /**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
+ * Copyright (c) 2015-present, Facebook, Inc.
  *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * 
  */
 
 function getLocation(source, position) {
@@ -5662,7 +5207,7 @@ function getLocation(source, position) {
 /**
  * Represents a location in a Source.
  */
-},{}],22:[function(require,module,exports){
+},{}],20:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -5692,14 +5237,13 @@ var _kinds = require('./kinds');
 /**
  * Configuration options to control parser behavior
  */
-
 /**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
+ * Copyright (c) 2015-present, Facebook, Inc.
  *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * 
  */
 
 function parse(source, options) {
@@ -6690,7 +6234,7 @@ function many(lexer, openKind, parseFn, closeKind) {
   }
   return nodes;
 }
-},{"../error":15,"./kinds":19,"./lexer":20,"./source":24}],23:[function(require,module,exports){
+},{"../error":13,"./kinds":17,"./lexer":18,"./source":22}],21:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -6707,12 +6251,10 @@ var _visitor = require('./visitor');
 function print(ast) {
   return (0, _visitor.visit)(ast, { leave: printDocASTReducer });
 } /**
-   *  Copyright (c) 2015, Facebook, Inc.
-   *  All rights reserved.
+   * Copyright (c) 2015-present, Facebook, Inc.
    *
-   *  This source code is licensed under the BSD-style license found in the
-   *  LICENSE file in the root directory of this source tree. An additional grant
-   *  of patent rights can be found in the PATENTS file in the same directory.
+   * This source code is licensed under the MIT license found in the
+   * LICENSE file in the root directory of this source tree.
    */
 
 var printDocASTReducer = {
@@ -6973,7 +6515,7 @@ function wrap(start, maybeString, end) {
 function indent(maybeString) {
   return maybeString && maybeString.replace(/\n/g, '\n  ');
 }
-},{"./visitor":25}],24:[function(require,module,exports){
+},{"./visitor":23}],22:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -6987,15 +6529,14 @@ var _invariant2 = _interopRequireDefault(_invariant);
 
 function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 
-function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } }
-/**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
- *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
- */
+function _classCallCheck(instance, Constructor) { if (!(instance instanceof Constructor)) { throw new TypeError("Cannot call a class as a function"); } } /**
+                                                                                                                                                           * Copyright (c) 2015-present, Facebook, Inc.
+                                                                                                                                                           *
+                                                                                                                                                           * This source code is licensed under the MIT license found in the
+                                                                                                                                                           * LICENSE file in the root directory of this source tree.
+                                                                                                                                                           *
+                                                                                                                                                           * 
+                                                                                                                                                           */
 
 /**
  * A representation of source input to GraphQL.
@@ -7014,7 +6555,7 @@ var Source = exports.Source = function Source(body, name, locationOffset) {
   !(this.locationOffset.line > 0) ? (0, _invariant2.default)(0, 'line in locationOffset is 1-indexed and must be positive') : void 0;
   !(this.locationOffset.column > 0) ? (0, _invariant2.default)(0, 'column in locationOffset is 1-indexed and must be positive') : void 0;
 };
-},{"../jsutils/invariant":18}],25:[function(require,module,exports){
+},{"../jsutils/invariant":16}],23:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -7025,12 +6566,10 @@ exports.visitInParallel = visitInParallel;
 exports.visitWithTypeInfo = visitWithTypeInfo;
 exports.getVisitFn = getVisitFn;
 /**
- *  Copyright (c) 2015, Facebook, Inc.
- *  All rights reserved.
+ * Copyright (c) 2015-present, Facebook, Inc.
  *
- *  This source code is licensed under the BSD-style license found in the
- *  LICENSE file in the root directory of this source tree. An additional grant
- *  of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
  */
 
 var QueryDocumentKeys = exports.QueryDocumentKeys = {
@@ -7406,256 +6945,7 @@ function getVisitFn(visitor, kind, isLeaving) {
     }
   }
 }
-},{}],26:[function(require,module,exports){
-var root = require('./_root');
-
-/** Built-in value references. */
-var Symbol = root.Symbol;
-
-module.exports = Symbol;
-
-},{"./_root":33}],27:[function(require,module,exports){
-var Symbol = require('./_Symbol'),
-    getRawTag = require('./_getRawTag'),
-    objectToString = require('./_objectToString');
-
-/** `Object#toString` result references. */
-var nullTag = '[object Null]',
-    undefinedTag = '[object Undefined]';
-
-/** Built-in value references. */
-var symToStringTag = Symbol ? Symbol.toStringTag : undefined;
-
-/**
- * The base implementation of `getTag` without fallbacks for buggy environments.
- *
- * @private
- * @param {*} value The value to query.
- * @returns {string} Returns the `toStringTag`.
- */
-function baseGetTag(value) {
-  if (value == null) {
-    return value === undefined ? undefinedTag : nullTag;
-  }
-  return (symToStringTag && symToStringTag in Object(value))
-    ? getRawTag(value)
-    : objectToString(value);
-}
-
-module.exports = baseGetTag;
-
-},{"./_Symbol":26,"./_getRawTag":30,"./_objectToString":31}],28:[function(require,module,exports){
-(function (global){
-/** Detect free variable `global` from Node.js. */
-var freeGlobal = typeof global == 'object' && global && global.Object === Object && global;
-
-module.exports = freeGlobal;
-
-}).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{}],29:[function(require,module,exports){
-var overArg = require('./_overArg');
-
-/** Built-in value references. */
-var getPrototype = overArg(Object.getPrototypeOf, Object);
-
-module.exports = getPrototype;
-
-},{"./_overArg":32}],30:[function(require,module,exports){
-var Symbol = require('./_Symbol');
-
-/** Used for built-in method references. */
-var objectProto = Object.prototype;
-
-/** Used to check objects for own properties. */
-var hasOwnProperty = objectProto.hasOwnProperty;
-
-/**
- * Used to resolve the
- * [`toStringTag`](http://ecma-international.org/ecma-262/7.0/#sec-object.prototype.tostring)
- * of values.
- */
-var nativeObjectToString = objectProto.toString;
-
-/** Built-in value references. */
-var symToStringTag = Symbol ? Symbol.toStringTag : undefined;
-
-/**
- * A specialized version of `baseGetTag` which ignores `Symbol.toStringTag` values.
- *
- * @private
- * @param {*} value The value to query.
- * @returns {string} Returns the raw `toStringTag`.
- */
-function getRawTag(value) {
-  var isOwn = hasOwnProperty.call(value, symToStringTag),
-      tag = value[symToStringTag];
-
-  try {
-    value[symToStringTag] = undefined;
-    var unmasked = true;
-  } catch (e) {}
-
-  var result = nativeObjectToString.call(value);
-  if (unmasked) {
-    if (isOwn) {
-      value[symToStringTag] = tag;
-    } else {
-      delete value[symToStringTag];
-    }
-  }
-  return result;
-}
-
-module.exports = getRawTag;
-
-},{"./_Symbol":26}],31:[function(require,module,exports){
-/** Used for built-in method references. */
-var objectProto = Object.prototype;
-
-/**
- * Used to resolve the
- * [`toStringTag`](http://ecma-international.org/ecma-262/7.0/#sec-object.prototype.tostring)
- * of values.
- */
-var nativeObjectToString = objectProto.toString;
-
-/**
- * Converts `value` to a string using `Object.prototype.toString`.
- *
- * @private
- * @param {*} value The value to convert.
- * @returns {string} Returns the converted string.
- */
-function objectToString(value) {
-  return nativeObjectToString.call(value);
-}
-
-module.exports = objectToString;
-
-},{}],32:[function(require,module,exports){
-/**
- * Creates a unary function that invokes `func` with its argument transformed.
- *
- * @private
- * @param {Function} func The function to wrap.
- * @param {Function} transform The argument transform.
- * @returns {Function} Returns the new function.
- */
-function overArg(func, transform) {
-  return function(arg) {
-    return func(transform(arg));
-  };
-}
-
-module.exports = overArg;
-
-},{}],33:[function(require,module,exports){
-var freeGlobal = require('./_freeGlobal');
-
-/** Detect free variable `self`. */
-var freeSelf = typeof self == 'object' && self && self.Object === Object && self;
-
-/** Used as a reference to the global object. */
-var root = freeGlobal || freeSelf || Function('return this')();
-
-module.exports = root;
-
-},{"./_freeGlobal":28}],34:[function(require,module,exports){
-/**
- * Checks if `value` is object-like. A value is object-like if it's not `null`
- * and has a `typeof` result of "object".
- *
- * @static
- * @memberOf _
- * @since 4.0.0
- * @category Lang
- * @param {*} value The value to check.
- * @returns {boolean} Returns `true` if `value` is object-like, else `false`.
- * @example
- *
- * _.isObjectLike({});
- * // => true
- *
- * _.isObjectLike([1, 2, 3]);
- * // => true
- *
- * _.isObjectLike(_.noop);
- * // => false
- *
- * _.isObjectLike(null);
- * // => false
- */
-function isObjectLike(value) {
-  return value != null && typeof value == 'object';
-}
-
-module.exports = isObjectLike;
-
-},{}],35:[function(require,module,exports){
-var baseGetTag = require('./_baseGetTag'),
-    getPrototype = require('./_getPrototype'),
-    isObjectLike = require('./isObjectLike');
-
-/** `Object#toString` result references. */
-var objectTag = '[object Object]';
-
-/** Used for built-in method references. */
-var funcProto = Function.prototype,
-    objectProto = Object.prototype;
-
-/** Used to resolve the decompiled source of functions. */
-var funcToString = funcProto.toString;
-
-/** Used to check objects for own properties. */
-var hasOwnProperty = objectProto.hasOwnProperty;
-
-/** Used to infer the `Object` constructor. */
-var objectCtorString = funcToString.call(Object);
-
-/**
- * Checks if `value` is a plain object, that is, an object created by the
- * `Object` constructor or one with a `[[Prototype]]` of `null`.
- *
- * @static
- * @memberOf _
- * @since 0.8.0
- * @category Lang
- * @param {*} value The value to check.
- * @returns {boolean} Returns `true` if `value` is a plain object, else `false`.
- * @example
- *
- * function Foo() {
- *   this.a = 1;
- * }
- *
- * _.isPlainObject(new Foo);
- * // => false
- *
- * _.isPlainObject([1, 2, 3]);
- * // => false
- *
- * _.isPlainObject({ 'x': 0, 'y': 0 });
- * // => true
- *
- * _.isPlainObject(Object.create(null));
- * // => true
- */
-function isPlainObject(value) {
-  if (!isObjectLike(value) || baseGetTag(value) != objectTag) {
-    return false;
-  }
-  var proto = getPrototype(value);
-  if (proto === null) {
-    return true;
-  }
-  var Ctor = hasOwnProperty.call(proto, 'constructor') && proto.constructor;
-  return typeof Ctor == 'function' && Ctor instanceof Ctor &&
-    funcToString.call(Ctor) == objectCtorString;
-}
-
-module.exports = isPlainObject;
-
-},{"./_baseGetTag":27,"./_getPrototype":29,"./isObjectLike":34}],36:[function(require,module,exports){
+},{}],24:[function(require,module,exports){
 // shim for using process in browser
 var process = module.exports = {};
 
@@ -7841,637 +7131,10 @@ process.chdir = function (dir) {
 };
 process.umask = function() { return 0; };
 
-},{}],37:[function(require,module,exports){
-'use strict';
-
-exports.__esModule = true;
-
-var _extends = Object.assign || function (target) { for (var i = 1; i < arguments.length; i++) { var source = arguments[i]; for (var key in source) { if (Object.prototype.hasOwnProperty.call(source, key)) { target[key] = source[key]; } } } return target; };
-
-exports['default'] = applyMiddleware;
-
-var _compose = require('./compose');
-
-var _compose2 = _interopRequireDefault(_compose);
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
-
-/**
- * Creates a store enhancer that applies middleware to the dispatch method
- * of the Redux store. This is handy for a variety of tasks, such as expressing
- * asynchronous actions in a concise manner, or logging every action payload.
- *
- * See `redux-thunk` package as an example of the Redux middleware.
- *
- * Because middleware is potentially asynchronous, this should be the first
- * store enhancer in the composition chain.
- *
- * Note that each middleware will be given the `dispatch` and `getState` functions
- * as named arguments.
- *
- * @param {...Function} middlewares The middleware chain to be applied.
- * @returns {Function} A store enhancer applying the middleware.
- */
-function applyMiddleware() {
-  for (var _len = arguments.length, middlewares = Array(_len), _key = 0; _key < _len; _key++) {
-    middlewares[_key] = arguments[_key];
-  }
-
-  return function (createStore) {
-    return function (reducer, preloadedState, enhancer) {
-      var store = createStore(reducer, preloadedState, enhancer);
-      var _dispatch = store.dispatch;
-      var chain = [];
-
-      var middlewareAPI = {
-        getState: store.getState,
-        dispatch: function dispatch(action) {
-          return _dispatch(action);
-        }
-      };
-      chain = middlewares.map(function (middleware) {
-        return middleware(middlewareAPI);
-      });
-      _dispatch = _compose2['default'].apply(undefined, chain)(store.dispatch);
-
-      return _extends({}, store, {
-        dispatch: _dispatch
-      });
-    };
-  };
-}
-},{"./compose":40}],38:[function(require,module,exports){
-'use strict';
-
-exports.__esModule = true;
-exports['default'] = bindActionCreators;
-function bindActionCreator(actionCreator, dispatch) {
-  return function () {
-    return dispatch(actionCreator.apply(undefined, arguments));
-  };
-}
-
-/**
- * Turns an object whose values are action creators, into an object with the
- * same keys, but with every function wrapped into a `dispatch` call so they
- * may be invoked directly. This is just a convenience method, as you can call
- * `store.dispatch(MyActionCreators.doSomething())` yourself just fine.
- *
- * For convenience, you can also pass a single function as the first argument,
- * and get a function in return.
- *
- * @param {Function|Object} actionCreators An object whose values are action
- * creator functions. One handy way to obtain it is to use ES6 `import * as`
- * syntax. You may also pass a single function.
- *
- * @param {Function} dispatch The `dispatch` function available on your Redux
- * store.
- *
- * @returns {Function|Object} The object mimicking the original object, but with
- * every action creator wrapped into the `dispatch` call. If you passed a
- * function as `actionCreators`, the return value will also be a single
- * function.
- */
-function bindActionCreators(actionCreators, dispatch) {
-  if (typeof actionCreators === 'function') {
-    return bindActionCreator(actionCreators, dispatch);
-  }
-
-  if (typeof actionCreators !== 'object' || actionCreators === null) {
-    throw new Error('bindActionCreators expected an object or a function, instead received ' + (actionCreators === null ? 'null' : typeof actionCreators) + '. ' + 'Did you write "import ActionCreators from" instead of "import * as ActionCreators from"?');
-  }
-
-  var keys = Object.keys(actionCreators);
-  var boundActionCreators = {};
-  for (var i = 0; i < keys.length; i++) {
-    var key = keys[i];
-    var actionCreator = actionCreators[key];
-    if (typeof actionCreator === 'function') {
-      boundActionCreators[key] = bindActionCreator(actionCreator, dispatch);
-    }
-  }
-  return boundActionCreators;
-}
-},{}],39:[function(require,module,exports){
-'use strict';
-
-exports.__esModule = true;
-exports['default'] = combineReducers;
-
-var _createStore = require('./createStore');
-
-var _isPlainObject = require('lodash/isPlainObject');
-
-var _isPlainObject2 = _interopRequireDefault(_isPlainObject);
-
-var _warning = require('./utils/warning');
-
-var _warning2 = _interopRequireDefault(_warning);
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
-
-function getUndefinedStateErrorMessage(key, action) {
-  var actionType = action && action.type;
-  var actionName = actionType && '"' + actionType.toString() + '"' || 'an action';
-
-  return 'Given action ' + actionName + ', reducer "' + key + '" returned undefined. ' + 'To ignore an action, you must explicitly return the previous state. ' + 'If you want this reducer to hold no value, you can return null instead of undefined.';
-}
-
-function getUnexpectedStateShapeWarningMessage(inputState, reducers, action, unexpectedKeyCache) {
-  var reducerKeys = Object.keys(reducers);
-  var argumentName = action && action.type === _createStore.ActionTypes.INIT ? 'preloadedState argument passed to createStore' : 'previous state received by the reducer';
-
-  if (reducerKeys.length === 0) {
-    return 'Store does not have a valid reducer. Make sure the argument passed ' + 'to combineReducers is an object whose values are reducers.';
-  }
-
-  if (!(0, _isPlainObject2['default'])(inputState)) {
-    return 'The ' + argumentName + ' has unexpected type of "' + {}.toString.call(inputState).match(/\s([a-z|A-Z]+)/)[1] + '". Expected argument to be an object with the following ' + ('keys: "' + reducerKeys.join('", "') + '"');
-  }
-
-  var unexpectedKeys = Object.keys(inputState).filter(function (key) {
-    return !reducers.hasOwnProperty(key) && !unexpectedKeyCache[key];
-  });
-
-  unexpectedKeys.forEach(function (key) {
-    unexpectedKeyCache[key] = true;
-  });
-
-  if (unexpectedKeys.length > 0) {
-    return 'Unexpected ' + (unexpectedKeys.length > 1 ? 'keys' : 'key') + ' ' + ('"' + unexpectedKeys.join('", "') + '" found in ' + argumentName + '. ') + 'Expected to find one of the known reducer keys instead: ' + ('"' + reducerKeys.join('", "') + '". Unexpected keys will be ignored.');
-  }
-}
-
-function assertReducerShape(reducers) {
-  Object.keys(reducers).forEach(function (key) {
-    var reducer = reducers[key];
-    var initialState = reducer(undefined, { type: _createStore.ActionTypes.INIT });
-
-    if (typeof initialState === 'undefined') {
-      throw new Error('Reducer "' + key + '" returned undefined during initialization. ' + 'If the state passed to the reducer is undefined, you must ' + 'explicitly return the initial state. The initial state may ' + 'not be undefined. If you don\'t want to set a value for this reducer, ' + 'you can use null instead of undefined.');
-    }
-
-    var type = '@@redux/PROBE_UNKNOWN_ACTION_' + Math.random().toString(36).substring(7).split('').join('.');
-    if (typeof reducer(undefined, { type: type }) === 'undefined') {
-      throw new Error('Reducer "' + key + '" returned undefined when probed with a random type. ' + ('Don\'t try to handle ' + _createStore.ActionTypes.INIT + ' or other actions in "redux/*" ') + 'namespace. They are considered private. Instead, you must return the ' + 'current state for any unknown actions, unless it is undefined, ' + 'in which case you must return the initial state, regardless of the ' + 'action type. The initial state may not be undefined, but can be null.');
-    }
-  });
-}
-
-/**
- * Turns an object whose values are different reducer functions, into a single
- * reducer function. It will call every child reducer, and gather their results
- * into a single state object, whose keys correspond to the keys of the passed
- * reducer functions.
- *
- * @param {Object} reducers An object whose values correspond to different
- * reducer functions that need to be combined into one. One handy way to obtain
- * it is to use ES6 `import * as reducers` syntax. The reducers may never return
- * undefined for any action. Instead, they should return their initial state
- * if the state passed to them was undefined, and the current state for any
- * unrecognized action.
- *
- * @returns {Function} A reducer function that invokes every reducer inside the
- * passed object, and builds a state object with the same shape.
- */
-function combineReducers(reducers) {
-  var reducerKeys = Object.keys(reducers);
-  var finalReducers = {};
-  for (var i = 0; i < reducerKeys.length; i++) {
-    var key = reducerKeys[i];
-
-    if ("production" !== 'production') {
-      if (typeof reducers[key] === 'undefined') {
-        (0, _warning2['default'])('No reducer provided for key "' + key + '"');
-      }
-    }
-
-    if (typeof reducers[key] === 'function') {
-      finalReducers[key] = reducers[key];
-    }
-  }
-  var finalReducerKeys = Object.keys(finalReducers);
-
-  var unexpectedKeyCache = void 0;
-  if ("production" !== 'production') {
-    unexpectedKeyCache = {};
-  }
-
-  var shapeAssertionError = void 0;
-  try {
-    assertReducerShape(finalReducers);
-  } catch (e) {
-    shapeAssertionError = e;
-  }
-
-  return function combination() {
-    var state = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
-    var action = arguments[1];
-
-    if (shapeAssertionError) {
-      throw shapeAssertionError;
-    }
-
-    if ("production" !== 'production') {
-      var warningMessage = getUnexpectedStateShapeWarningMessage(state, finalReducers, action, unexpectedKeyCache);
-      if (warningMessage) {
-        (0, _warning2['default'])(warningMessage);
-      }
-    }
-
-    var hasChanged = false;
-    var nextState = {};
-    for (var _i = 0; _i < finalReducerKeys.length; _i++) {
-      var _key = finalReducerKeys[_i];
-      var reducer = finalReducers[_key];
-      var previousStateForKey = state[_key];
-      var nextStateForKey = reducer(previousStateForKey, action);
-      if (typeof nextStateForKey === 'undefined') {
-        var errorMessage = getUndefinedStateErrorMessage(_key, action);
-        throw new Error(errorMessage);
-      }
-      nextState[_key] = nextStateForKey;
-      hasChanged = hasChanged || nextStateForKey !== previousStateForKey;
-    }
-    return hasChanged ? nextState : state;
-  };
-}
-},{"./createStore":41,"./utils/warning":43,"lodash/isPlainObject":35}],40:[function(require,module,exports){
-"use strict";
-
-exports.__esModule = true;
-exports["default"] = compose;
-/**
- * Composes single-argument functions from right to left. The rightmost
- * function can take multiple arguments as it provides the signature for
- * the resulting composite function.
- *
- * @param {...Function} funcs The functions to compose.
- * @returns {Function} A function obtained by composing the argument functions
- * from right to left. For example, compose(f, g, h) is identical to doing
- * (...args) => f(g(h(...args))).
- */
-
-function compose() {
-  for (var _len = arguments.length, funcs = Array(_len), _key = 0; _key < _len; _key++) {
-    funcs[_key] = arguments[_key];
-  }
-
-  if (funcs.length === 0) {
-    return function (arg) {
-      return arg;
-    };
-  }
-
-  if (funcs.length === 1) {
-    return funcs[0];
-  }
-
-  return funcs.reduce(function (a, b) {
-    return function () {
-      return a(b.apply(undefined, arguments));
-    };
-  });
-}
-},{}],41:[function(require,module,exports){
-'use strict';
-
-exports.__esModule = true;
-exports.ActionTypes = undefined;
-exports['default'] = createStore;
-
-var _isPlainObject = require('lodash/isPlainObject');
-
-var _isPlainObject2 = _interopRequireDefault(_isPlainObject);
-
-var _symbolObservable = require('symbol-observable');
-
-var _symbolObservable2 = _interopRequireDefault(_symbolObservable);
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
-
-/**
- * These are private action types reserved by Redux.
- * For any unknown actions, you must return the current state.
- * If the current state is undefined, you must return the initial state.
- * Do not reference these action types directly in your code.
- */
-var ActionTypes = exports.ActionTypes = {
-  INIT: '@@redux/INIT'
-
-  /**
-   * Creates a Redux store that holds the state tree.
-   * The only way to change the data in the store is to call `dispatch()` on it.
-   *
-   * There should only be a single store in your app. To specify how different
-   * parts of the state tree respond to actions, you may combine several reducers
-   * into a single reducer function by using `combineReducers`.
-   *
-   * @param {Function} reducer A function that returns the next state tree, given
-   * the current state tree and the action to handle.
-   *
-   * @param {any} [preloadedState] The initial state. You may optionally specify it
-   * to hydrate the state from the server in universal apps, or to restore a
-   * previously serialized user session.
-   * If you use `combineReducers` to produce the root reducer function, this must be
-   * an object with the same shape as `combineReducers` keys.
-   *
-   * @param {Function} [enhancer] The store enhancer. You may optionally specify it
-   * to enhance the store with third-party capabilities such as middleware,
-   * time travel, persistence, etc. The only store enhancer that ships with Redux
-   * is `applyMiddleware()`.
-   *
-   * @returns {Store} A Redux store that lets you read the state, dispatch actions
-   * and subscribe to changes.
-   */
-};function createStore(reducer, preloadedState, enhancer) {
-  var _ref2;
-
-  if (typeof preloadedState === 'function' && typeof enhancer === 'undefined') {
-    enhancer = preloadedState;
-    preloadedState = undefined;
-  }
-
-  if (typeof enhancer !== 'undefined') {
-    if (typeof enhancer !== 'function') {
-      throw new Error('Expected the enhancer to be a function.');
-    }
-
-    return enhancer(createStore)(reducer, preloadedState);
-  }
-
-  if (typeof reducer !== 'function') {
-    throw new Error('Expected the reducer to be a function.');
-  }
-
-  var currentReducer = reducer;
-  var currentState = preloadedState;
-  var currentListeners = [];
-  var nextListeners = currentListeners;
-  var isDispatching = false;
-
-  function ensureCanMutateNextListeners() {
-    if (nextListeners === currentListeners) {
-      nextListeners = currentListeners.slice();
-    }
-  }
-
-  /**
-   * Reads the state tree managed by the store.
-   *
-   * @returns {any} The current state tree of your application.
-   */
-  function getState() {
-    return currentState;
-  }
-
-  /**
-   * Adds a change listener. It will be called any time an action is dispatched,
-   * and some part of the state tree may potentially have changed. You may then
-   * call `getState()` to read the current state tree inside the callback.
-   *
-   * You may call `dispatch()` from a change listener, with the following
-   * caveats:
-   *
-   * 1. The subscriptions are snapshotted just before every `dispatch()` call.
-   * If you subscribe or unsubscribe while the listeners are being invoked, this
-   * will not have any effect on the `dispatch()` that is currently in progress.
-   * However, the next `dispatch()` call, whether nested or not, will use a more
-   * recent snapshot of the subscription list.
-   *
-   * 2. The listener should not expect to see all state changes, as the state
-   * might have been updated multiple times during a nested `dispatch()` before
-   * the listener is called. It is, however, guaranteed that all subscribers
-   * registered before the `dispatch()` started will be called with the latest
-   * state by the time it exits.
-   *
-   * @param {Function} listener A callback to be invoked on every dispatch.
-   * @returns {Function} A function to remove this change listener.
-   */
-  function subscribe(listener) {
-    if (typeof listener !== 'function') {
-      throw new Error('Expected listener to be a function.');
-    }
-
-    var isSubscribed = true;
-
-    ensureCanMutateNextListeners();
-    nextListeners.push(listener);
-
-    return function unsubscribe() {
-      if (!isSubscribed) {
-        return;
-      }
-
-      isSubscribed = false;
-
-      ensureCanMutateNextListeners();
-      var index = nextListeners.indexOf(listener);
-      nextListeners.splice(index, 1);
-    };
-  }
-
-  /**
-   * Dispatches an action. It is the only way to trigger a state change.
-   *
-   * The `reducer` function, used to create the store, will be called with the
-   * current state tree and the given `action`. Its return value will
-   * be considered the **next** state of the tree, and the change listeners
-   * will be notified.
-   *
-   * The base implementation only supports plain object actions. If you want to
-   * dispatch a Promise, an Observable, a thunk, or something else, you need to
-   * wrap your store creating function into the corresponding middleware. For
-   * example, see the documentation for the `redux-thunk` package. Even the
-   * middleware will eventually dispatch plain object actions using this method.
-   *
-   * @param {Object} action A plain object representing “what changed”. It is
-   * a good idea to keep actions serializable so you can record and replay user
-   * sessions, or use the time travelling `redux-devtools`. An action must have
-   * a `type` property which may not be `undefined`. It is a good idea to use
-   * string constants for action types.
-   *
-   * @returns {Object} For convenience, the same action object you dispatched.
-   *
-   * Note that, if you use a custom middleware, it may wrap `dispatch()` to
-   * return something else (for example, a Promise you can await).
-   */
-  function dispatch(action) {
-    if (!(0, _isPlainObject2['default'])(action)) {
-      throw new Error('Actions must be plain objects. ' + 'Use custom middleware for async actions.');
-    }
-
-    if (typeof action.type === 'undefined') {
-      throw new Error('Actions may not have an undefined "type" property. ' + 'Have you misspelled a constant?');
-    }
-
-    if (isDispatching) {
-      throw new Error('Reducers may not dispatch actions.');
-    }
-
-    try {
-      isDispatching = true;
-      currentState = currentReducer(currentState, action);
-    } finally {
-      isDispatching = false;
-    }
-
-    var listeners = currentListeners = nextListeners;
-    for (var i = 0; i < listeners.length; i++) {
-      var listener = listeners[i];
-      listener();
-    }
-
-    return action;
-  }
-
-  /**
-   * Replaces the reducer currently used by the store to calculate the state.
-   *
-   * You might need this if your app implements code splitting and you want to
-   * load some of the reducers dynamically. You might also need this if you
-   * implement a hot reloading mechanism for Redux.
-   *
-   * @param {Function} nextReducer The reducer for the store to use instead.
-   * @returns {void}
-   */
-  function replaceReducer(nextReducer) {
-    if (typeof nextReducer !== 'function') {
-      throw new Error('Expected the nextReducer to be a function.');
-    }
-
-    currentReducer = nextReducer;
-    dispatch({ type: ActionTypes.INIT });
-  }
-
-  /**
-   * Interoperability point for observable/reactive libraries.
-   * @returns {observable} A minimal observable of state changes.
-   * For more information, see the observable proposal:
-   * https://github.com/tc39/proposal-observable
-   */
-  function observable() {
-    var _ref;
-
-    var outerSubscribe = subscribe;
-    return _ref = {
-      /**
-       * The minimal observable subscription method.
-       * @param {Object} observer Any object that can be used as an observer.
-       * The observer object should have a `next` method.
-       * @returns {subscription} An object with an `unsubscribe` method that can
-       * be used to unsubscribe the observable from the store, and prevent further
-       * emission of values from the observable.
-       */
-      subscribe: function subscribe(observer) {
-        if (typeof observer !== 'object') {
-          throw new TypeError('Expected the observer to be an object.');
-        }
-
-        function observeState() {
-          if (observer.next) {
-            observer.next(getState());
-          }
-        }
-
-        observeState();
-        var unsubscribe = outerSubscribe(observeState);
-        return { unsubscribe: unsubscribe };
-      }
-    }, _ref[_symbolObservable2['default']] = function () {
-      return this;
-    }, _ref;
-  }
-
-  // When a store is created, an "INIT" action is dispatched so that every
-  // reducer returns their initial state. This effectively populates
-  // the initial state tree.
-  dispatch({ type: ActionTypes.INIT });
-
-  return _ref2 = {
-    dispatch: dispatch,
-    subscribe: subscribe,
-    getState: getState,
-    replaceReducer: replaceReducer
-  }, _ref2[_symbolObservable2['default']] = observable, _ref2;
-}
-},{"lodash/isPlainObject":35,"symbol-observable":44}],42:[function(require,module,exports){
-'use strict';
-
-exports.__esModule = true;
-exports.compose = exports.applyMiddleware = exports.bindActionCreators = exports.combineReducers = exports.createStore = undefined;
-
-var _createStore = require('./createStore');
-
-var _createStore2 = _interopRequireDefault(_createStore);
-
-var _combineReducers = require('./combineReducers');
-
-var _combineReducers2 = _interopRequireDefault(_combineReducers);
-
-var _bindActionCreators = require('./bindActionCreators');
-
-var _bindActionCreators2 = _interopRequireDefault(_bindActionCreators);
-
-var _applyMiddleware = require('./applyMiddleware');
-
-var _applyMiddleware2 = _interopRequireDefault(_applyMiddleware);
-
-var _compose = require('./compose');
-
-var _compose2 = _interopRequireDefault(_compose);
-
-var _warning = require('./utils/warning');
-
-var _warning2 = _interopRequireDefault(_warning);
-
-function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { 'default': obj }; }
-
-/*
-* This is a dummy function to check if the function name has been altered by minification.
-* If the function has been minified and NODE_ENV !== 'production', warn the user.
-*/
-function isCrushed() {}
-
-if ("production" !== 'production' && typeof isCrushed.name === 'string' && isCrushed.name !== 'isCrushed') {
-  (0, _warning2['default'])('You are currently using minified code outside of NODE_ENV === \'production\'. ' + 'This means that you are running a slower development build of Redux. ' + 'You can use loose-envify (https://github.com/zertosh/loose-envify) for browserify ' + 'or DefinePlugin for webpack (http://stackoverflow.com/questions/30030031) ' + 'to ensure you have the correct code for your production build.');
-}
-
-exports.createStore = _createStore2['default'];
-exports.combineReducers = _combineReducers2['default'];
-exports.bindActionCreators = _bindActionCreators2['default'];
-exports.applyMiddleware = _applyMiddleware2['default'];
-exports.compose = _compose2['default'];
-},{"./applyMiddleware":37,"./bindActionCreators":38,"./combineReducers":39,"./compose":40,"./createStore":41,"./utils/warning":43}],43:[function(require,module,exports){
-'use strict';
-
-exports.__esModule = true;
-exports['default'] = warning;
-/**
- * Prints a warning in the console if it exists.
- *
- * @param {String} message The warning message.
- * @returns {void}
- */
-function warning(message) {
-  /* eslint-disable no-console */
-  if (typeof console !== 'undefined' && typeof console.error === 'function') {
-    console.error(message);
-  }
-  /* eslint-enable no-console */
-  try {
-    // This error was thrown as a convenience so that if you enable
-    // "break on all exceptions" in your console,
-    // it would pause the execution at this line.
-    throw new Error(message);
-    /* eslint-disable no-empty */
-  } catch (e) {}
-  /* eslint-enable no-empty */
-}
-},{}],44:[function(require,module,exports){
+},{}],25:[function(require,module,exports){
 module.exports = require('./lib/index');
 
-},{"./lib/index":45}],45:[function(require,module,exports){
+},{"./lib/index":26}],26:[function(require,module,exports){
 (function (global){
 'use strict';
 
@@ -8479,7 +7142,7 @@ Object.defineProperty(exports, "__esModule", {
   value: true
 });
 
-var _ponyfill = require('./ponyfill');
+var _ponyfill = require('./ponyfill.js');
 
 var _ponyfill2 = _interopRequireDefault(_ponyfill);
 
@@ -8503,7 +7166,7 @@ if (typeof self !== 'undefined') {
 var result = (0, _ponyfill2['default'])(root);
 exports['default'] = result;
 }).call(this,typeof global !== "undefined" ? global : typeof self !== "undefined" ? self : typeof window !== "undefined" ? window : {})
-},{"./ponyfill":46}],46:[function(require,module,exports){
+},{"./ponyfill.js":27}],27:[function(require,module,exports){
 'use strict';
 
 Object.defineProperty(exports, "__esModule", {
@@ -8527,867 +7190,506 @@ function symbolObservablePonyfill(root) {
 
 	return result;
 };
-},{}],47:[function(require,module,exports){
-(function(self) {
-  'use strict';
+},{}],28:[function(require,module,exports){
+module.exports = require("./zen-observable.js").Observable;
 
-  if (self.fetch) {
-    return
-  }
+},{"./zen-observable.js":29}],29:[function(require,module,exports){
+'use strict'; (function(fn, name) { if (typeof exports !== 'undefined') fn(exports, module); else if (typeof self !== 'undefined') fn(name === '*' ? self : (name ? self[name] = {} : {})); })(function(exports, module) { // === Symbol Support ===
 
-  var support = {
-    searchParams: 'URLSearchParams' in self,
-    iterable: 'Symbol' in self && 'iterator' in Symbol,
-    blob: 'FileReader' in self && 'Blob' in self && (function() {
-      try {
-        new Blob()
-        return true
-      } catch(e) {
-        return false
-      }
-    })(),
-    formData: 'FormData' in self,
-    arrayBuffer: 'ArrayBuffer' in self
-  }
+function hasSymbol(name) {
+  return typeof Symbol === "function" && Boolean(Symbol[name]);
+}
 
-  if (support.arrayBuffer) {
-    var viewClasses = [
-      '[object Int8Array]',
-      '[object Uint8Array]',
-      '[object Uint8ClampedArray]',
-      '[object Int16Array]',
-      '[object Uint16Array]',
-      '[object Int32Array]',
-      '[object Uint32Array]',
-      '[object Float32Array]',
-      '[object Float64Array]'
-    ]
+function getSymbol(name) {
+  return hasSymbol(name) ? Symbol[name] : "@@" + name;
+}
 
-    var isDataView = function(obj) {
-      return obj && DataView.prototype.isPrototypeOf(obj)
-    }
+// Ponyfill Symbol.observable for interoperability with other libraries
+if (typeof Symbol === "function" && !Symbol.observable) {
+  Symbol.observable = Symbol("observable");
+}
 
-    var isArrayBufferView = ArrayBuffer.isView || function(obj) {
-      return obj && viewClasses.indexOf(Object.prototype.toString.call(obj)) > -1
+// === Abstract Operations ===
+
+function getMethod(obj, key) {
+  var value = obj[key];
+
+  if (value == null)
+    return undefined;
+
+  if (typeof value !== "function")
+    throw new TypeError(value + " is not a function");
+
+  return value;
+}
+
+function getSpecies(obj) {
+  var ctor = obj.constructor;
+  if (ctor !== undefined) {
+    ctor = ctor[getSymbol("species")];
+    if (ctor === null) {
+      ctor = undefined;
     }
   }
+  return ctor !== undefined ? ctor : Observable;
+}
+
+function addMethods(target, methods) {
+  Object.keys(methods).forEach(function(k) {
+    var desc = Object.getOwnPropertyDescriptor(methods, k);
+    desc.enumerable = false;
+    Object.defineProperty(target, k, desc);
+  });
+}
 
-  function normalizeName(name) {
-    if (typeof name !== 'string') {
-      name = String(name)
-    }
-    if (/[^a-z0-9\-#$%&'*+.\^_`|~]/i.test(name)) {
-      throw new TypeError('Invalid character in header field name')
-    }
-    return name.toLowerCase()
-  }
-
-  function normalizeValue(value) {
-    if (typeof value !== 'string') {
-      value = String(value)
-    }
-    return value
-  }
-
-  // Build a destructive iterator for the value list
-  function iteratorFor(items) {
-    var iterator = {
-      next: function() {
-        var value = items.shift()
-        return {done: value === undefined, value: value}
-      }
-    }
-
-    if (support.iterable) {
-      iterator[Symbol.iterator] = function() {
-        return iterator
-      }
-    }
-
-    return iterator
-  }
-
-  function Headers(headers) {
-    this.map = {}
-
-    if (headers instanceof Headers) {
-      headers.forEach(function(value, name) {
-        this.append(name, value)
-      }, this)
-    } else if (Array.isArray(headers)) {
-      headers.forEach(function(header) {
-        this.append(header[0], header[1])
-      }, this)
-    } else if (headers) {
-      Object.getOwnPropertyNames(headers).forEach(function(name) {
-        this.append(name, headers[name])
-      }, this)
-    }
-  }
-
-  Headers.prototype.append = function(name, value) {
-    name = normalizeName(name)
-    value = normalizeValue(value)
-    var oldValue = this.map[name]
-    this.map[name] = oldValue ? oldValue+','+value : value
-  }
-
-  Headers.prototype['delete'] = function(name) {
-    delete this.map[normalizeName(name)]
-  }
-
-  Headers.prototype.get = function(name) {
-    name = normalizeName(name)
-    return this.has(name) ? this.map[name] : null
-  }
-
-  Headers.prototype.has = function(name) {
-    return this.map.hasOwnProperty(normalizeName(name))
-  }
-
-  Headers.prototype.set = function(name, value) {
-    this.map[normalizeName(name)] = normalizeValue(value)
-  }
-
-  Headers.prototype.forEach = function(callback, thisArg) {
-    for (var name in this.map) {
-      if (this.map.hasOwnProperty(name)) {
-        callback.call(thisArg, this.map[name], name, this)
-      }
-    }
-  }
-
-  Headers.prototype.keys = function() {
-    var items = []
-    this.forEach(function(value, name) { items.push(name) })
-    return iteratorFor(items)
-  }
-
-  Headers.prototype.values = function() {
-    var items = []
-    this.forEach(function(value) { items.push(value) })
-    return iteratorFor(items)
-  }
-
-  Headers.prototype.entries = function() {
-    var items = []
-    this.forEach(function(value, name) { items.push([name, value]) })
-    return iteratorFor(items)
-  }
-
-  if (support.iterable) {
-    Headers.prototype[Symbol.iterator] = Headers.prototype.entries
-  }
-
-  function consumed(body) {
-    if (body.bodyUsed) {
-      return Promise.reject(new TypeError('Already read'))
-    }
-    body.bodyUsed = true
-  }
-
-  function fileReaderReady(reader) {
-    return new Promise(function(resolve, reject) {
-      reader.onload = function() {
-        resolve(reader.result)
-      }
-      reader.onerror = function() {
-        reject(reader.error)
-      }
-    })
-  }
-
-  function readBlobAsArrayBuffer(blob) {
-    var reader = new FileReader()
-    var promise = fileReaderReady(reader)
-    reader.readAsArrayBuffer(blob)
-    return promise
-  }
-
-  function readBlobAsText(blob) {
-    var reader = new FileReader()
-    var promise = fileReaderReady(reader)
-    reader.readAsText(blob)
-    return promise
-  }
-
-  function readArrayBufferAsText(buf) {
-    var view = new Uint8Array(buf)
-    var chars = new Array(view.length)
-
-    for (var i = 0; i < view.length; i++) {
-      chars[i] = String.fromCharCode(view[i])
-    }
-    return chars.join('')
-  }
-
-  function bufferClone(buf) {
-    if (buf.slice) {
-      return buf.slice(0)
-    } else {
-      var view = new Uint8Array(buf.byteLength)
-      view.set(new Uint8Array(buf))
-      return view.buffer
-    }
-  }
-
-  function Body() {
-    this.bodyUsed = false
-
-    this._initBody = function(body) {
-      this._bodyInit = body
-      if (!body) {
-        this._bodyText = ''
-      } else if (typeof body === 'string') {
-        this._bodyText = body
-      } else if (support.blob && Blob.prototype.isPrototypeOf(body)) {
-        this._bodyBlob = body
-      } else if (support.formData && FormData.prototype.isPrototypeOf(body)) {
-        this._bodyFormData = body
-      } else if (support.searchParams && URLSearchParams.prototype.isPrototypeOf(body)) {
-        this._bodyText = body.toString()
-      } else if (support.arrayBuffer && support.blob && isDataView(body)) {
-        this._bodyArrayBuffer = bufferClone(body.buffer)
-        // IE 10-11 can't handle a DataView body.
-        this._bodyInit = new Blob([this._bodyArrayBuffer])
-      } else if (support.arrayBuffer && (ArrayBuffer.prototype.isPrototypeOf(body) || isArrayBufferView(body))) {
-        this._bodyArrayBuffer = bufferClone(body)
-      } else {
-        throw new Error('unsupported BodyInit type')
-      }
-
-      if (!this.headers.get('content-type')) {
-        if (typeof body === 'string') {
-          this.headers.set('content-type', 'text/plain;charset=UTF-8')
-        } else if (this._bodyBlob && this._bodyBlob.type) {
-          this.headers.set('content-type', this._bodyBlob.type)
-        } else if (support.searchParams && URLSearchParams.prototype.isPrototypeOf(body)) {
-          this.headers.set('content-type', 'application/x-www-form-urlencoded;charset=UTF-8')
-        }
-      }
-    }
-
-    if (support.blob) {
-      this.blob = function() {
-        var rejected = consumed(this)
-        if (rejected) {
-          return rejected
-        }
-
-        if (this._bodyBlob) {
-          return Promise.resolve(this._bodyBlob)
-        } else if (this._bodyArrayBuffer) {
-          return Promise.resolve(new Blob([this._bodyArrayBuffer]))
-        } else if (this._bodyFormData) {
-          throw new Error('could not read FormData body as blob')
-        } else {
-          return Promise.resolve(new Blob([this._bodyText]))
-        }
-      }
-
-      this.arrayBuffer = function() {
-        if (this._bodyArrayBuffer) {
-          return consumed(this) || Promise.resolve(this._bodyArrayBuffer)
-        } else {
-          return this.blob().then(readBlobAsArrayBuffer)
-        }
-      }
-    }
-
-    this.text = function() {
-      var rejected = consumed(this)
-      if (rejected) {
-        return rejected
-      }
-
-      if (this._bodyBlob) {
-        return readBlobAsText(this._bodyBlob)
-      } else if (this._bodyArrayBuffer) {
-        return Promise.resolve(readArrayBufferAsText(this._bodyArrayBuffer))
-      } else if (this._bodyFormData) {
-        throw new Error('could not read FormData body as text')
-      } else {
-        return Promise.resolve(this._bodyText)
-      }
-    }
-
-    if (support.formData) {
-      this.formData = function() {
-        return this.text().then(decode)
-      }
-    }
-
-    this.json = function() {
-      return this.text().then(JSON.parse)
-    }
-
-    return this
-  }
-
-  // HTTP methods whose capitalization should be normalized
-  var methods = ['DELETE', 'GET', 'HEAD', 'OPTIONS', 'POST', 'PUT']
-
-  function normalizeMethod(method) {
-    var upcased = method.toUpperCase()
-    return (methods.indexOf(upcased) > -1) ? upcased : method
-  }
-
-  function Request(input, options) {
-    options = options || {}
-    var body = options.body
-
-    if (input instanceof Request) {
-      if (input.bodyUsed) {
-        throw new TypeError('Already read')
-      }
-      this.url = input.url
-      this.credentials = input.credentials
-      if (!options.headers) {
-        this.headers = new Headers(input.headers)
-      }
-      this.method = input.method
-      this.mode = input.mode
-      if (!body && input._bodyInit != null) {
-        body = input._bodyInit
-        input.bodyUsed = true
-      }
-    } else {
-      this.url = String(input)
-    }
-
-    this.credentials = options.credentials || this.credentials || 'omit'
-    if (options.headers || !this.headers) {
-      this.headers = new Headers(options.headers)
-    }
-    this.method = normalizeMethod(options.method || this.method || 'GET')
-    this.mode = options.mode || this.mode || null
-    this.referrer = null
-
-    if ((this.method === 'GET' || this.method === 'HEAD') && body) {
-      throw new TypeError('Body not allowed for GET or HEAD requests')
-    }
-    this._initBody(body)
-  }
-
-  Request.prototype.clone = function() {
-    return new Request(this, { body: this._bodyInit })
-  }
-
-  function decode(body) {
-    var form = new FormData()
-    body.trim().split('&').forEach(function(bytes) {
-      if (bytes) {
-        var split = bytes.split('=')
-        var name = split.shift().replace(/\+/g, ' ')
-        var value = split.join('=').replace(/\+/g, ' ')
-        form.append(decodeURIComponent(name), decodeURIComponent(value))
-      }
-    })
-    return form
-  }
-
-  function parseHeaders(rawHeaders) {
-    var headers = new Headers()
-    rawHeaders.split(/\r?\n/).forEach(function(line) {
-      var parts = line.split(':')
-      var key = parts.shift().trim()
-      if (key) {
-        var value = parts.join(':').trim()
-        headers.append(key, value)
-      }
-    })
-    return headers
-  }
-
-  Body.call(Request.prototype)
-
-  function Response(bodyInit, options) {
-    if (!options) {
-      options = {}
-    }
-
-    this.type = 'default'
-    this.status = 'status' in options ? options.status : 200
-    this.ok = this.status >= 200 && this.status < 300
-    this.statusText = 'statusText' in options ? options.statusText : 'OK'
-    this.headers = new Headers(options.headers)
-    this.url = options.url || ''
-    this._initBody(bodyInit)
-  }
-
-  Body.call(Response.prototype)
-
-  Response.prototype.clone = function() {
-    return new Response(this._bodyInit, {
-      status: this.status,
-      statusText: this.statusText,
-      headers: new Headers(this.headers),
-      url: this.url
-    })
-  }
-
-  Response.error = function() {
-    var response = new Response(null, {status: 0, statusText: ''})
-    response.type = 'error'
-    return response
-  }
-
-  var redirectStatuses = [301, 302, 303, 307, 308]
-
-  Response.redirect = function(url, status) {
-    if (redirectStatuses.indexOf(status) === -1) {
-      throw new RangeError('Invalid status code')
-    }
-
-    return new Response(null, {status: status, headers: {location: url}})
-  }
-
-  self.Headers = Headers
-  self.Request = Request
-  self.Response = Response
-
-  self.fetch = function(input, init) {
-    return new Promise(function(resolve, reject) {
-      var request = new Request(input, init)
-      var xhr = new XMLHttpRequest()
-
-      xhr.onload = function() {
-        var options = {
-          status: xhr.status,
-          statusText: xhr.statusText,
-          headers: parseHeaders(xhr.getAllResponseHeaders() || '')
-        }
-        options.url = 'responseURL' in xhr ? xhr.responseURL : options.headers.get('X-Request-URL')
-        var body = 'response' in xhr ? xhr.response : xhr.responseText
-        resolve(new Response(body, options))
-      }
-
-      xhr.onerror = function() {
-        reject(new TypeError('Network request failed'))
-      }
-
-      xhr.ontimeout = function() {
-        reject(new TypeError('Network request failed'))
-      }
-
-      xhr.open(request.method, request.url, true)
-
-      if (request.credentials === 'include') {
-        xhr.withCredentials = true
-      }
-
-      if ('responseType' in xhr && support.blob) {
-        xhr.responseType = 'blob'
-      }
-
-      request.headers.forEach(function(value, name) {
-        xhr.setRequestHeader(name, value)
-      })
-
-      xhr.send(typeof request._bodyInit === 'undefined' ? null : request._bodyInit)
-    })
-  }
-  self.fetch.polyfill = true
-})(typeof self !== 'undefined' ? self : this);
-
-},{}],48:[function(require,module,exports){
-"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
 function cleanupSubscription(subscription) {
-    var cleanup = subscription._cleanup;
-    if (!cleanup) {
-        return;
-    }
-    subscription._cleanup = undefined;
-    cleanup();
-}
-function subscriptionClosed(subscription) {
-    return subscription._observer === undefined;
-}
-function closeSubscription(subscription) {
-    if (subscriptionClosed(subscription)) {
-        return;
-    }
-    subscription._observer = undefined;
-    cleanupSubscription(subscription);
-}
-function cleanupFromSubscription(subscription) {
-    return function () {
-        subscription.unsubscribe();
-    };
-}
-var Subscription = (function () {
-    function Subscription(observer, subscriber) {
-        if (Object(observer) !== observer) {
-            throw new TypeError('Observer must be an object');
-        }
-        this._cleanup = undefined;
-        this._observer = observer;
-        if (observer.start) {
-            observer.start(this);
-        }
-        if (subscriptionClosed(this)) {
-            return;
-        }
-        var _observer = new SubscriptionObserver(this);
-        try {
-            var cleanup = subscriber(_observer);
-            if (cleanup != null) {
-                if (typeof cleanup.unsubscribe ===
-                    'function') {
-                    cleanup = cleanupFromSubscription(cleanup);
-                }
-                else if (typeof cleanup !== 'function') {
-                    throw new TypeError(cleanup + ' is not a function');
-                }
-                this._cleanup = cleanup;
-            }
-        }
-        catch (e) {
-            if (_observer.error) {
-                _observer.error(e);
-            }
-            return;
-        }
-        if (subscriptionClosed(this)) {
-            cleanupSubscription(this);
-        }
-    }
-    Object.defineProperty(Subscription.prototype, "closed", {
-        get: function () {
-            return subscriptionClosed(this);
-        },
-        enumerable: true,
-        configurable: true
-    });
-    Subscription.prototype.unsubscribe = function () {
-        closeSubscription(this);
-    };
-    return Subscription;
-}());
-exports.Subscription = Subscription;
-var SubscriptionObserver = (function () {
-    function SubscriptionObserver(subscription) {
-        this._subscription = subscription;
-    }
-    Object.defineProperty(SubscriptionObserver.prototype, "closed", {
-        get: function () {
-            return subscriptionClosed(this._subscription);
-        },
-        enumerable: true,
-        configurable: true
-    });
-    SubscriptionObserver.prototype.next = function (value) {
-        var subscription = this._subscription;
-        if (subscriptionClosed(subscription)) {
-            return;
-        }
-        var observer = subscription._observer;
-        if (!observer.next) {
-            return;
-        }
-        observer.next(value);
-        return;
-    };
-    SubscriptionObserver.prototype.error = function (value) {
-        var subscription = this._subscription;
-        if (subscriptionClosed(subscription)) {
-            throw value;
-        }
-        var observer = subscription._observer;
-        subscription._observer = undefined;
-        try {
-            if (!observer.error) {
-                throw value;
-            }
-            observer.error(value);
-        }
-        catch (e) {
-            try {
-                cleanupSubscription(subscription);
-            }
-            finally {
-                throw e;
-            }
-        }
-        cleanupSubscription(subscription);
-    };
-    SubscriptionObserver.prototype.complete = function () {
-        var subscription = this._subscription;
-        if (subscriptionClosed(subscription)) {
-            return;
-        }
-        var observer = subscription._observer;
-        subscription._observer = undefined;
-        try {
-            if (observer.complete) {
-                observer.complete();
-            }
-        }
-        catch (e) {
-            try {
-                cleanupSubscription(subscription);
-            }
-            finally {
-                throw e;
-            }
-        }
-        cleanupSubscription(subscription);
-    };
-    return SubscriptionObserver;
-}());
-exports.SubscriptionObserver = SubscriptionObserver;
-var Observable = (function () {
-    function Observable(subscriber) {
-        if (typeof subscriber !== 'function') {
-            throw new TypeError('Observable initializer must be a function');
-        }
-        this._subscriber = subscriber;
-    }
-    Observable.from = function (observable) {
-        if (observable.subscribe) {
-            return new Observable(function (observer) {
-                return observable.subscribe(observer);
-            });
-        }
-        if (Array.isArray(observable)) {
-            return new Observable(function (observer) {
-                for (var i = 0; i < observable.length; ++i) {
-                    observer.next(observable[i]);
-                    if (observer.closed) {
-                        return;
-                    }
-                }
-                if (observer.complete) {
-                    observer.complete();
-                }
-            });
-        }
-        throw new TypeError(observable + ' is not observable');
-    };
-    Observable.of = function () {
-        var items = [];
-        for (var _i = 0; _i < arguments.length; _i++) {
-            items[_i] = arguments[_i];
-        }
-        return new Observable(function (observer) {
-            for (var i = 0; i < items.length; ++i) {
-                observer.next(items[i]);
-                if (observer.closed) {
-                    return;
-                }
-            }
-            if (observer.complete) {
-                observer.complete();
-            }
-        });
-    };
-    Observable.prototype.subscribe = function (observerOrNext, error, complete) {
-        if (typeof observerOrNext === 'function') {
-            return new Subscription({
-                next: observerOrNext,
-                error: error,
-                complete: complete,
-            }, this._subscriber);
-        }
-        return new Subscription(observerOrNext, this._subscriber);
-    };
-    Observable.prototype.forEach = function (fn) {
-        var _this = this;
-        return new Promise(function (resolve, reject) {
-            if (typeof fn !== 'function') {
-                return Promise.reject(new TypeError(fn + ' is not a function'));
-            }
-            _this.subscribe({
-                start: function (subscription) {
-                    this._subscription = subscription;
-                },
-                next: function (value) {
-                    var subscription = this._subscription;
-                    if (subscription.closed) {
-                        return;
-                    }
-                    try {
-                        fn(value);
-                        return;
-                    }
-                    catch (err) {
-                        reject(err);
-                        subscription.unsubscribe();
-                    }
-                },
-                error: reject,
-                complete: resolve,
-            });
-        });
-    };
-    Observable.prototype.map = function (fn) {
-        var _this = this;
-        if (typeof fn !== 'function') {
-            throw new TypeError(fn + ' is not a function');
-        }
-        return new Observable(function (observer) {
-            return _this.subscribe({
-                next: function (value) {
-                    if (observer.closed) {
-                        return;
-                    }
-                    var _value;
-                    try {
-                        _value = fn(value);
-                    }
-                    catch (e) {
-                        observer.error(e);
-                        return;
-                    }
-                    observer.next(_value);
-                },
-                error: function (e) {
-                    observer.error(e);
-                },
-                complete: function () {
-                    observer.complete();
-                },
-            });
-        });
-    };
-    Observable.prototype.filter = function (fn) {
-        var _this = this;
-        if (typeof fn !== 'function') {
-            throw new TypeError(fn + ' is not a function');
-        }
-        return new Observable(function (observer) {
-            _this.subscribe({
-                next: function (value) {
-                    if (observer.closed) {
-                        return;
-                    }
-                    try {
-                        if (!fn(value)) {
-                            return;
-                        }
-                    }
-                    catch (e) {
-                        if (observer.error) {
-                            observer.error(e);
-                        }
-                        return;
-                    }
-                    observer.next(value);
-                },
-                error: function (e) {
-                    observer.error(e);
-                },
-                complete: function () {
-                    observer.complete();
-                },
-            });
-        });
-    };
-    Observable.prototype.reduce = function (fn, initialValue) {
-        var _this = this;
-        if (typeof fn !== 'function') {
-            throw new TypeError(fn + ' is not a function');
-        }
-        var hasSeed = arguments.length > 1;
-        var hasValue = false;
-        var seed = arguments[1];
-        var acc = seed;
-        return new Observable(function (observer) {
-            _this.subscribe({
-                next: function (value) {
-                    if (observer.closed) {
-                        return;
-                    }
-                    var first = !hasValue;
-                    hasValue = true;
-                    if (!first || hasSeed) {
-                        try {
-                            acc = fn(acc, value);
-                        }
-                        catch (e) {
-                            observer.error(e);
-                            return;
-                        }
-                    }
-                    else {
-                        acc = value;
-                    }
-                },
-                error: function (e) {
-                    observer.error(e);
-                },
-                complete: function () {
-                    if (!hasValue && !hasSeed) {
-                        observer.error(new TypeError('Cannot reduce an empty sequence'));
-                        return;
-                    }
-                    observer.next(acc);
-                    observer.complete();
-                },
-            });
-        });
-    };
-    Observable.prototype.flatMap = function (fn) {
-        var _this = this;
-        if (typeof fn !== 'function') {
-            throw new TypeError(fn + ' is not a function');
-        }
-        return new Observable(function (observer) {
-            var completed = false;
-            var subscriptions = [];
-            var outer = _this.subscribe({
-                next: function (value) {
-                    var _value;
-                    if (fn) {
-                        try {
-                            _value = fn(value);
-                        }
-                        catch (x) {
-                            observer.error(x);
-                            return;
-                        }
-                    }
-                    Observable.from(_value).subscribe({
-                        start: function (s) {
-                            subscriptions.push((this._subscription = s));
-                        },
-                        next: function (data) {
-                            observer.next(data);
-                        },
-                        error: function (e) {
-                            observer.error(e);
-                        },
-                        complete: function () {
-                            var i = subscriptions.indexOf(this._subscription);
-                            if (i >= 0) {
-                                subscriptions.splice(i, 1);
-                            }
-                            closeIfDone();
-                        },
-                    });
-                },
-                error: function (e) {
-                    observer.error(e);
-                },
-                complete: function () {
-                    completed = true;
-                    closeIfDone();
-                },
-            });
-            function closeIfDone() {
-                if (completed && subscriptions.length === 0) {
-                    observer.complete();
-                }
-            }
-            return function () {
-                subscriptions.forEach(function (s) { return s.unsubscribe(); });
-                outer.unsubscribe();
-            };
-        });
-    };
-    return Observable;
-}());
-exports.default = Observable;
+  // Assert:  observer._observer is undefined
 
+  var cleanup = subscription._cleanup;
+
+  if (!cleanup)
+    return;
+
+  // Drop the reference to the cleanup function so that we won't call it
+  // more than once
+  subscription._cleanup = undefined;
+
+  // Call the cleanup function
+  cleanup();
+}
+
+function subscriptionClosed(subscription) {
+  return subscription._observer === undefined;
+}
+
+function closeSubscription(subscription) {
+  if (subscriptionClosed(subscription))
+    return;
+
+  subscription._observer = undefined;
+  cleanupSubscription(subscription);
+}
+
+function cleanupFromSubscription(subscription) {
+  return function() { subscription.unsubscribe() };
+}
+
+function Subscription(observer, subscriber) {
+  // Assert: subscriber is callable
+
+  // The observer must be an object
+  if (Object(observer) !== observer)
+    throw new TypeError("Observer must be an object");
+
+  this._cleanup = undefined;
+  this._observer = observer;
+
+  var start = getMethod(observer, "start");
+
+  if (start)
+    start.call(observer, this);
+
+  if (subscriptionClosed(this))
+    return;
+
+  observer = new SubscriptionObserver(this);
+
+  try {
+    // Call the subscriber function
+    var cleanup$0 = subscriber.call(undefined, observer);
+
+    // The return value must be undefined, null, a subscription object, or a function
+    if (cleanup$0 != null) {
+      if (typeof cleanup$0.unsubscribe === "function")
+        cleanup$0 = cleanupFromSubscription(cleanup$0);
+      else if (typeof cleanup$0 !== "function")
+        throw new TypeError(cleanup$0 + " is not a function");
+
+      this._cleanup = cleanup$0;
+    }
+  } catch (e) {
+    // If an error occurs during startup, then attempt to send the error
+    // to the observer
+    observer.error(e);
+    return;
+  }
+
+  // If the stream is already finished, then perform cleanup
+  if (subscriptionClosed(this))
+    cleanupSubscription(this);
+}
+
+addMethods(Subscription.prototype = {}, {
+  get closed() { return subscriptionClosed(this) },
+  unsubscribe: function() { closeSubscription(this) },
+});
+
+function SubscriptionObserver(subscription) {
+  this._subscription = subscription;
+}
+
+addMethods(SubscriptionObserver.prototype = {}, {
+
+  get closed() { return subscriptionClosed(this._subscription) },
+
+  next: function(value) {
+    var subscription = this._subscription;
+
+    // If the stream is closed, then return undefined
+    if (subscriptionClosed(subscription))
+      return undefined;
+
+    var observer = subscription._observer;
+    var m = getMethod(observer, "next");
+
+    // If the observer doesn't support "next", then return undefined
+    if (!m)
+      return undefined;
+
+    // Send the next value to the sink
+    return m.call(observer, value);
+  },
+
+  error: function(value) {
+    var subscription = this._subscription;
+
+    // If the stream is closed, throw the error to the caller
+    if (subscriptionClosed(subscription))
+      throw value;
+
+    var observer = subscription._observer;
+    subscription._observer = undefined;
+
+    try {
+      var m$0 = getMethod(observer, "error");
+
+      // If the sink does not support "error", then throw the error to the caller
+      if (!m$0)
+        throw value;
+
+      value = m$0.call(observer, value);
+    } catch (e) {
+      try { cleanupSubscription(subscription) }
+      finally { throw e }
+    }
+
+    cleanupSubscription(subscription);
+    return value;
+  },
+
+  complete: function(value) {
+    var subscription = this._subscription;
+
+    // If the stream is closed, then return undefined
+    if (subscriptionClosed(subscription))
+      return undefined;
+
+    var observer = subscription._observer;
+    subscription._observer = undefined;
+
+    try {
+      var m$1 = getMethod(observer, "complete");
+
+      // If the sink does not support "complete", then return undefined
+      value = m$1 ? m$1.call(observer, value) : undefined;
+    } catch (e) {
+      try { cleanupSubscription(subscription) }
+      finally { throw e }
+    }
+
+    cleanupSubscription(subscription);
+    return value;
+  },
+
+});
+
+function Observable(subscriber) {
+  // The stream subscriber must be a function
+  if (typeof subscriber !== "function")
+    throw new TypeError("Observable initializer must be a function");
+
+  this._subscriber = subscriber;
+}
+
+addMethods(Observable.prototype, {
+
+  subscribe: function(observer) { for (var args = [], __$0 = 1; __$0 < arguments.length; ++__$0) args.push(arguments[__$0]); 
+    if (typeof observer === 'function') {
+      observer = {
+        next: observer,
+        error: args[0],
+        complete: args[1],
+      };
+    }
+
+    return new Subscription(observer, this._subscriber);
+  },
+
+  forEach: function(fn) { var __this = this; 
+    return new Promise(function(resolve, reject) {
+      if (typeof fn !== "function")
+        return Promise.reject(new TypeError(fn + " is not a function"));
+
+      __this.subscribe({
+        _subscription: null,
+
+        start: function(subscription) {
+          if (Object(subscription) !== subscription)
+            throw new TypeError(subscription + " is not an object");
+
+          this._subscription = subscription;
+        },
+
+        next: function(value) {
+          var subscription = this._subscription;
+
+          if (subscription.closed)
+            return;
+
+          try {
+            return fn(value);
+          } catch (err) {
+            reject(err);
+            subscription.unsubscribe();
+          }
+        },
+
+        error: reject,
+        complete: resolve,
+      });
+    });
+  },
+
+  map: function(fn) { var __this = this; 
+    if (typeof fn !== "function")
+      throw new TypeError(fn + " is not a function");
+
+    var C = getSpecies(this);
+
+    return new C(function(observer) { return __this.subscribe({
+      next: function(value) {
+        if (observer.closed)
+          return;
+
+        try { value = fn(value) }
+        catch (e) { return observer.error(e) }
+
+        return observer.next(value);
+      },
+
+      error: function(e) { return observer.error(e) },
+      complete: function(x) { return observer.complete(x) },
+    }); });
+  },
+
+  filter: function(fn) { var __this = this; 
+    if (typeof fn !== "function")
+      throw new TypeError(fn + " is not a function");
+
+    var C = getSpecies(this);
+
+    return new C(function(observer) { return __this.subscribe({
+      next: function(value) {
+        if (observer.closed)
+          return;
+
+        try { if (!fn(value)) return undefined }
+        catch (e) { return observer.error(e) }
+
+        return observer.next(value);
+      },
+
+      error: function(e) { return observer.error(e) },
+      complete: function() { return observer.complete() },
+    }); });
+  },
+
+  reduce: function(fn) { var __this = this; 
+    if (typeof fn !== "function")
+      throw new TypeError(fn + " is not a function");
+
+    var C = getSpecies(this);
+    var hasSeed = arguments.length > 1;
+    var hasValue = false;
+    var seed = arguments[1];
+    var acc = seed;
+
+    return new C(function(observer) { return __this.subscribe({
+
+      next: function(value) {
+        if (observer.closed)
+          return;
+
+        var first = !hasValue;
+        hasValue = true;
+
+        if (!first || hasSeed) {
+          try { acc = fn(acc, value) }
+          catch (e) { return observer.error(e) }
+        } else {
+          acc = value;
+        }
+      },
+
+      error: function(e) { observer.error(e) },
+
+      complete: function() {
+        if (!hasValue && !hasSeed) {
+          observer.error(new TypeError("Cannot reduce an empty sequence"));
+          return;
+        }
+
+        observer.next(acc);
+        observer.complete();
+      },
+
+    }); });
+  },
+
+  flatMap: function(fn) { var __this = this; 
+    if (typeof fn !== "function")
+      throw new TypeError(fn + " is not a function");
+
+    var C = getSpecies(this);
+
+    return new C(function(observer) {
+      var completed = false;
+      var subscriptions = [];
+
+      // Subscribe to the outer Observable
+      var outer = __this.subscribe({
+
+        next: function(value) {
+          if (fn) {
+            try {
+              value = fn(value);
+            } catch (x) {
+              observer.error(x);
+              return;
+            }
+          }
+
+          // Subscribe to the inner Observable
+          Observable.from(value).subscribe({
+            _subscription: null,
+
+            start: function(s) { subscriptions.push(this._subscription = s) },
+            next: function(value) { observer.next(value) },
+            error: function(e) { observer.error(e) },
+
+            complete: function() {
+              var i = subscriptions.indexOf(this._subscription);
+
+              if (i >= 0)
+                subscriptions.splice(i, 1);
+
+              closeIfDone();
+            }
+          });
+        },
+
+        error: function(e) {
+          return observer.error(e);
+        },
+
+        complete: function() {
+          completed = true;
+          closeIfDone();
+        }
+      });
+
+      function closeIfDone() {
+        if (completed && subscriptions.length === 0)
+          observer.complete();
+      }
+
+      return function() {
+        subscriptions.forEach(function(s) { return s.unsubscribe(); });
+        outer.unsubscribe();
+      };
+    });
+  },
+
+});
+
+Object.defineProperty(Observable.prototype, getSymbol("observable"), {
+  value: function() { return this },
+  writable: true,
+  configurable: true,
+});
+
+addMethods(Observable, {
+
+  from: function(x) {
+    var C = typeof this === "function" ? this : Observable;
+
+    if (x == null)
+      throw new TypeError(x + " is not an object");
+
+    var method = getMethod(x, getSymbol("observable"));
+
+    if (method) {
+      var observable$0 = method.call(x);
+
+      if (Object(observable$0) !== observable$0)
+        throw new TypeError(observable$0 + " is not an object");
+
+      if (observable$0.constructor === C)
+        return observable$0;
+
+      return new C(function(observer) { return observable$0.subscribe(observer); });
+    }
+
+    if (hasSymbol("iterator") && (method = getMethod(x, getSymbol("iterator")))) {
+      return new C(function(observer) {
+        for (var __$0 = (method.call(x))[Symbol.iterator](), __$1; __$1 = __$0.next(), !__$1.done;) { var item$0 = __$1.value; 
+          observer.next(item$0);
+          if (observer.closed)
+            return;
+        }
+
+        observer.complete();
+      });
+    }
+
+    if (Array.isArray(x)) {
+      return new C(function(observer) {
+        for (var i$0 = 0; i$0 < x.length; ++i$0) {
+          observer.next(x[i$0]);
+          if (observer.closed)
+            return;
+        }
+
+        observer.complete();
+      });
+    }
+
+    throw new TypeError(x + " is not observable");
+  },
+
+  of: function() { for (var items = [], __$0 = 0; __$0 < arguments.length; ++__$0) items.push(arguments[__$0]); 
+    var C = typeof this === "function" ? this : Observable;
+
+    return new C(function(observer) {
+      for (var i$1 = 0; i$1 < items.length; ++i$1) {
+        observer.next(items[i$1]);
+        if (observer.closed)
+          return;
+      }
+
+      observer.complete();
+    });
+  },
+
+});
+
+Object.defineProperty(Observable, getSymbol("species"), {
+  get: function() { return this },
+  configurable: true,
+});
+
+exports.Observable = Observable;
+
+
+}, "*");
 },{}]},{},[1]);
